@@ -13,18 +13,26 @@ class LegalGraphState(TypedDict, total=False):
     # Inbound query specifications
     query: str
     domain: Optional[str]
+    document_id: Optional[str]
     jurisdiction: str
     force_complex: bool
 
-    # Classification results
+    # Classification & routing results
     query_complexity: QueryComplexity
     selected_model: str
     classification_reasoning: Optional[str]
+    detected_domain: Optional[str]
+    domain_inferred: bool
+    retrieval_top_k: int
+    retrieval_min_score: float
 
-    # Vector retrieval artifacts
+    # Vector retrieval & evidence artifacts
     query_embedding: list[float]
     retrieved_chunks: list[dict[str, Any]]
+    filtered_chunks: list[dict[str, Any]]
+    context_text: str
     fallback_triggered: bool
+    filter_relaxed: bool
 
     # Generation & reasoning outputs
     raw_answer: str

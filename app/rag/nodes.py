@@ -1,15 +1,23 @@
 """Discrete execution nodes for the LangGraph legal research workflow."""
 
 import re
-from typing import Any
+from typing import Any, Optional
 from app.clients.nebius import NebiusTokenFactoryClient
 from app.clients.qdrant import QdrantClientWrapper
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.constants import (
     DEFAULT_MIN_SIMILARITY_SCORE,
     DEFAULT_TOP_K_RETRIEVAL,
+    LEGAL_DOMAIN_CORPORATE,
+    LEGAL_DOMAIN_CRIMINAL,
+    LEGAL_DOMAIN_EMPLOYMENT,
+    LEGAL_DOMAIN_GENERAL,
+    LEGAL_DOMAIN_STARTUP,
+    LEGAL_DOMAIN_TAXATION,
+    VALID_LEGAL_DOMAINS,
 )
 from app.core.logging import get_logger
+from app.rag.context import build_grounded_context_block, prune_chunks_by_score_margin
 from app.rag.state import LegalGraphState
 
 logger = get_logger(__name__)
@@ -39,44 +47,76 @@ COMPLEX_LEGAL_INDICATORS: tuple[str, ...] = (
 )
 
 
+def _detect_domain_from_keywords(query: str) -> Optional[str]:
+    """Heuristic keyword detection for Indian legal domain categorization."""
+    lowered = query.lower()
+    if any(k in lowered for k in ["income tax", "gst", "tds", "assessment year", "it act", "customs", "taxation", "cgst", "sgst", "section 148", "advance tax", "deemed dividend"]):
+        return LEGAL_DOMAIN_TAXATION
+    if any(k in lowered for k in ["company", "companies act", "director", "board meeting", "shareholder", "mca", "roc", "nclt", "nclat", "amalgamation", "merger", "debenture", "lifting the corporate veil", "csr"]):
+        return LEGAL_DOMAIN_CORPORATE
+    if any(k in lowered for k in ["employee", "workman", "gratuity", "provident fund", "pf", "wage", "industrial dispute", "factories act", "termination of workman", "maternity benefit"]):
+        return LEGAL_DOMAIN_EMPLOYMENT
+    if any(k in lowered for k in ["startup", "dpiit", "angel tax", "esop", "term sheet", "convertible note", "seed round"]):
+        return LEGAL_DOMAIN_STARTUP
+    if any(k in lowered for k in ["bns", "crpc", "ipc", "police", "fir", "bail", "arrest", "pmla", "money laundering", "cheque bounce", "section 138"]):
+        return LEGAL_DOMAIN_CRIMINAL
+    return None
+
+
 async def classify_query_node(
     state: LegalGraphState,
     nebius_client: NebiusTokenFactoryClient,
     settings: Settings,
 ) -> dict[str, Any]:
     """
-    Classifies inbound legal questions to route between Nemotron Nano and Nemotron Super.
-    
-    Categorization Rules:
-    - 'simple': Definitional inquiries, single-section statutory thresholds, standard penalty
-      schedules, filing timelines, or direct compliance lookups.
-      -> Handled efficiently by nvidia/nemotron-3-nano-30b-a3b.
-    - 'complex': Interplay between conflicting statutes (e.g., IBC vs Companies Act vs SARFAESI),
-      interpretative ambiguities, jurisdictional conflicts, tax litigation, or precedent reconciliation.
-      -> Routed to nvidia/nemotron-3-super-120b-a12b for multi-hop legal reasoning.
+    Classifies inbound legal questions to route between Nemotron Nano and Nemotron Super,
+    infers domain if omitted, and configures adaptive retrieval bounds.
     """
     query_text = state.get("query", "").strip()
+    explicit_domain = state.get("domain")
+    force_complex = state.get("force_complex", False)
 
-    # Manual force-override if client explicitly demands high-capacity reasoning
-    if state.get("force_complex", False):
+    # 1. Determine domain: preserve explicit or infer from heuristics
+    domain_inferred = explicit_domain is None or not explicit_domain.strip()
+    detected_domain: Optional[str] = explicit_domain if not domain_inferred else _detect_domain_from_keywords(query_text)
+
+    # Helper to calculate adaptive retrieval bounds
+    def _get_adaptive_bounds(is_complex_tier: bool) -> tuple[int, float]:
+        if is_complex_tier:
+            return settings.top_k_complex, settings.min_score_complex
+        return settings.top_k_simple, settings.min_score_simple
+
+    # 2. Manual force-override if client explicitly demands high-capacity reasoning
+    if force_complex:
         logger.info("Forced complex reasoning requested by client caller")
+        top_k, min_score = _get_adaptive_bounds(True)
         return {
             "query_complexity": "complex",
             "selected_model": settings.nemotron_super_model,
             "classification_reasoning": "Client explicitly set force_complex_reasoning flag.",
+            "detected_domain": detected_domain or LEGAL_DOMAIN_GENERAL,
+            "domain_inferred": domain_inferred,
+            "retrieval_top_k": top_k,
+            "retrieval_min_score": min_score,
         }
 
-    # Fast heuristic check for overt multi-statute indicators
+    # 3. Fast heuristic check for overt multi-statute indicators
     lowered_query = query_text.lower()
     matches = [indicator for indicator in COMPLEX_LEGAL_INDICATORS if indicator in lowered_query]
     if len(matches) >= 2:
         logger.info("Heuristic complexity trigger matched indicators: %s", matches)
+        top_k, min_score = _get_adaptive_bounds(True)
         return {
             "query_complexity": "complex",
             "selected_model": settings.nemotron_super_model,
             "classification_reasoning": f"Query contains multiple complex legal terms: {', '.join(matches)}",
+            "detected_domain": detected_domain or LEGAL_DOMAIN_GENERAL,
+            "domain_inferred": domain_inferred,
+            "retrieval_top_k": top_k,
+            "retrieval_min_score": min_score,
         }
 
+    # 4. LLM Classification & Domain Inference via Nemotron Nano
     classification_prompt = [
         {
             "role": "system",
@@ -86,8 +126,10 @@ async def classify_query_node(
                 "Classify the query strictly into one of two tiers:\n"
                 "1. 'SIMPLE': Single provision lookup, straightforward statutory thresholds, basic definition, filing fees, or direct statutory penalties.\n"
                 "2. 'COMPLEX': Multi-statute interplay, reconciliation of contradictory precedents, structural tax/corporate reorganization, constitutional challenge, or ambiguous statutory interpretations.\n\n"
+                "Also identify the primary Indian legal domain among: taxation, corporate_law, employment_labor, startup_compliance, criminal_procedure, general_statutory.\n\n"
                 "Output Format:\n"
                 "CLASSIFICATION: [SIMPLE or COMPLEX]\n"
+                "DOMAIN: [taxation | corporate_law | employment_labor | startup_compliance | criminal_procedure | general_statutory]\n"
                 "RATIONALE: [One sentence explanation]"
             ),
         },
@@ -108,9 +150,23 @@ async def classify_query_node(
             settings.nemotron_super_model if is_complex else settings.nemotron_nano_model
         )
 
+        # Extract domain from response if not yet determined
+        if domain_inferred and not detected_domain:
+            for domain_candidate in VALID_LEGAL_DOMAINS:
+                if f"DOMAIN: {domain_candidate}".lower() in classification_result.lower() or domain_candidate in classification_result.lower():
+                    detected_domain = domain_candidate
+                    break
+
+        resolved_domain = detected_domain or LEGAL_DOMAIN_GENERAL
+        top_k, min_score = _get_adaptive_bounds(is_complex)
+
         logger.info(
-            "Query classified | assigned: %s | model: %s",
+            "Query classified | assigned: %s | domain: %s (inferred: %s) | top_k: %d | min_score: %.2f | model: %s",
             assigned_complexity,
+            resolved_domain,
+            domain_inferred,
+            top_k,
+            min_score,
             assigned_model,
         )
 
@@ -118,6 +174,10 @@ async def classify_query_node(
             "query_complexity": assigned_complexity,
             "selected_model": assigned_model,
             "classification_reasoning": classification_result,
+            "detected_domain": resolved_domain,
+            "domain_inferred": domain_inferred,
+            "retrieval_top_k": top_k,
+            "retrieval_min_score": min_score,
         }
 
     except Exception as exc:
@@ -125,10 +185,15 @@ async def classify_query_node(
             "Classification node encountered error; defaulting conservatively to Super-120b: %s",
             exc,
         )
+        top_k, min_score = _get_adaptive_bounds(True)
         return {
             "query_complexity": "complex",
             "selected_model": settings.nemotron_super_model,
             "classification_reasoning": f"Fallback to complex tier due to classifier error: {exc}",
+            "detected_domain": detected_domain or LEGAL_DOMAIN_GENERAL,
+            "domain_inferred": domain_inferred,
+            "retrieval_top_k": top_k,
+            "retrieval_min_score": min_score,
         }
 
 
@@ -141,11 +206,16 @@ async def retrieve_context_node(
     """
     Retrieves grounding legal provisions and case law precedents from Qdrant Cloud.
     
-    Generates dense embeddings with BAAI/bge-m3 via Nebius Token Factory and handles
-    empty retrieval outcomes without terminating the pipeline.
+    Applies adaptive top-k and min-score thresholds, compound filtering on domain and
+    document_id, strict filter relaxation rules, and relative score margin pruning.
     """
     query_text = state["query"]
-    domain_hint = state.get("domain")
+    domain_to_filter = state.get("detected_domain") or state.get("domain")
+    document_id_filter = state.get("document_id")
+    domain_inferred = state.get("domain_inferred", False)
+
+    top_k = state.get("retrieval_top_k", settings.top_k_retrieval_limit)
+    min_score = state.get("retrieval_min_score", settings.min_similarity_score)
 
     # Step 1: Generate query embedding vector via Nebius Token Factory
     query_vector = await nebius_client.create_embedding(text=query_text)
@@ -153,104 +223,148 @@ async def retrieve_context_node(
     # Step 2: Vector similarity search against pre-embedded corpus in Qdrant Cloud
     retrieved_statutes = await qdrant_wrapper.search_statutes(
         query_vector=query_vector,
-        top_k=settings.top_k_retrieval_limit,
-        min_score=settings.min_similarity_score,
-        domain_filter=domain_hint,
+        top_k=top_k,
+        min_score=min_score,
+        domain_filter=domain_to_filter,
+        document_id_filter=document_id_filter,
     )
 
+    filter_relaxed = False
+
+    # Step 3: Enforce strict Filter Relaxation Safety Rules (Mandatory Correction #1)
     if not retrieved_statutes:
-        logger.warning(
-            "Zero statutory records retrieved surpassing similarity threshold %.2f for query: %s",
-            settings.min_similarity_score,
-            query_text,
-        )
-        return {
-            "query_embedding": query_vector,
-            "retrieved_chunks": [],
-            "fallback_triggered": True,
-        }
+        # If user explicitly provided document_id: NEVER relax!
+        if document_id_filter and document_id_filter.strip():
+            logger.info(
+                "Zero chunks retrieved for explicit document_id '%s'. Preserving strict document boundary; not relaxing.",
+                document_id_filter,
+            )
+        # If domain was automatically inferred (and no doc_id was passed), execute controlled relaxation
+        elif domain_inferred and domain_to_filter:
+            logger.info(
+                "Zero chunks retrieved with auto-inferred domain filter '%s'. Executing controlled filter relaxation.",
+                domain_to_filter,
+            )
+            relaxed_statutes = await qdrant_wrapper.search_statutes(
+                query_vector=query_vector,
+                top_k=top_k,
+                min_score=min_score,
+                domain_filter=None,
+                document_id_filter=None,
+            )
+            if relaxed_statutes:
+                retrieved_statutes = relaxed_statutes
+                filter_relaxed = True
+                logger.info("Filter relaxation succeeded: recovered %d statutory chunks", len(retrieved_statutes))
+            else:
+                filter_relaxed = True
+        else:
+            logger.info("Zero chunks retrieved for explicit domain filter '%s'; preserving client filter.", domain_to_filter)
 
     serialized_chunks = [chunk.model_dump() for chunk in retrieved_statutes]
+
+    # Step 4: Relative Score Margin Pruning
+    filtered_chunks = prune_chunks_by_score_margin(
+        serialized_chunks,
+        margin_ratio=settings.score_margin_ratio,
+        min_score=min_score,
+    )
+
+    fallback_triggered = len(filtered_chunks) == 0
+
+    if fallback_triggered:
+        logger.warning(
+            "Zero statutory records survived filtering and score margin pruning (floor %.2f) for query: %s",
+            min_score,
+            query_text,
+        )
+
     return {
         "query_embedding": query_vector,
         "retrieved_chunks": serialized_chunks,
-        "fallback_triggered": False,
+        "filtered_chunks": filtered_chunks,
+        "fallback_triggered": fallback_triggered,
+        "filter_relaxed": filter_relaxed,
     }
 
 
 async def generate_answer_node(
     state: LegalGraphState,
     nebius_client: NebiusTokenFactoryClient,
+    settings: Optional[Settings] = None,
 ) -> dict[str, Any]:
     """
     Synthesizes the legal opinion using the assigned Nemotron reasoning tier.
     
-    Constructs an Indian legal context block with exact statutory sections and provisions.
-    Extracts output from `reasoning_content` (with fallback to `content`).
+    Applies strict evidence-first grounding rules and anti-hallucination guardrails.
+    Never invents sections or answers from memory when retrieval evidence is absent.
     """
     query_text = state["query"]
     selected_model = state["selected_model"]
-    retrieved_chunks = state.get("retrieved_chunks", [])
+    current_settings = settings or get_settings()
+
+    # Prefer filtered_chunks (pruned/deduplicated), fallback to retrieved_chunks for backward compatibility
+    candidate_chunks = state.get("filtered_chunks")
+    if candidate_chunks is None:
+        candidate_chunks = state.get("retrieved_chunks", [])
+
     fallback_triggered = state.get("fallback_triggered", False)
 
-    # Compile statutory context block
-    if retrieved_chunks:
-        context_segments = []
-        for index, chunk in enumerate(retrieved_chunks, start=1):
-            act_header = f"[{index}] {chunk['act_name']}, {chunk['section']}"
-            if chunk.get("title"):
-                act_header += f" - {chunk['title']}"
-            if chunk.get("court_or_authority"):
-                act_header += f" ({chunk['court_or_authority']}"
-                if chunk.get("citation_ref"):
-                    act_header += f", {chunk['citation_ref']}"
-                act_header += ")"
-
-            context_segments.append(
-                f"{act_header}\nVERBATIM PROVISION:\n{chunk['content']}\n"
-            )
-        compiled_context = "\n---\n".join(context_segments)
-    else:
-        compiled_context = (
-            "No direct statutory chunks met the similarity threshold in the legal vector index. "
-            "Proceed based on core Indian codified statutes, general principles of jurisprudence, "
-            "and explicitly state that exact section verification from the Official Gazette is recommended."
-        )
+    # Compile statutory exhibition context block with character budgeting
+    compiled_context, included_chunks = build_grounded_context_block(
+        candidate_chunks,
+        max_chars=current_settings.max_context_chars,
+    )
 
     system_instruction = (
-        "You are LexiRAG, a senior legal research counsel specializing in Indian Corporate, Tax, "
-        "Regulatory, and Commercial Law. Your audience comprises Indian Advocates, Chartered Accountants, "
-        "and General Counsels.\n\n"
-        "Guidelines for Indian Legal Synthesis:\n"
-        "1. GROUNDING: Anchor every assertion in Indian statutes (e.g., Companies Act 2013, Income Tax Act 1961, "
-        "GST Acts 2017, IBC 2016, BNS 2023, FEMA 1999) using the provided context.\n"
-        "2. SPECIFICITY: Cite specific Section numbers, Sub-sections, Provsios, and Explanation clauses.\n"
-        "3. STRUCTURE: Provide: (a) Executive Summary / Direct Conclusion, (b) Statutory Analysis & Relevant Provisions, "
-        "(c) Compliance Implications / Practical Risks, (d) Formal Citations.\n"
-        "4. TONE: Authoritative, formal, and legally rigorous. Do not use conversational filler."
+        "You are LexiRAG, an authoritative Indian senior legal research counsel specializing in Indian "
+        "Corporate, Tax, Labor, and Commercial Law. Your audience consists of Advocates, Chartered Accountants, "
+        "and In-House Legal Counsel.\n\n"
+        "STRICT GROUNDING DIRECTIVES (EVIDENCE-FIRST PRINCIPLE):\n"
+        "1. EXCLUSIVE RELIANCE ON EXHIBITS: Ground your legal opinion exclusively on the provisions and facts provided "
+        "in the numbered exhibits below ([EXHIBIT 1], [EXHIBIT 2], etc.).\n"
+        "2. PROHIBITION OF SPECULATION: Never invent, assume, or speculate regarding statutory Section numbers, sub-sections, "
+        "or penalty figures not explicitly evidenced in the exhibits.\n"
+        "3. SAFE REFUSAL ON ABSENT EVIDENCE: If no exhibits are provided or if the indexed corpus contains insufficient evidence, "
+        "explicitly declare that the indexed corpus does not contain sufficient statutory evidence to answer the question, "
+        "and decline to fabricate statutory provisions.\n"
+        "4. EXPLICIT EVIDENCE BOUNDARIES: If the provided exhibits partially answer the query, clearly demarcate what is "
+        "substantiated by the evidence from what remains unsupported.\n"
+        "5. FORMAL STRUCTURE: (a) Executive Conclusion, (b) Statutory / Contractual Analysis grounded in Exhibits, "
+        "(c) Compliance Implications & Practical Risks, (d) Evidentiary Scope & Limitations."
     )
 
-    user_message_content = (
-        f"STATUTORY & PRECEDENT CONTEXT:\n{compiled_context}\n\n"
-        f"CLIENT LEGAL QUERY:\n{query_text}\n\n"
-        "Provide your grounded legal opinion:"
-    )
+    if fallback_triggered or not included_chunks:
+        user_message_content = (
+            f"STATUTORY & DOCUMENT EVIDENCE CONTEXT:\n{compiled_context}\n\n"
+            f"CLIENT LEGAL QUERY:\n{query_text}\n\n"
+            "INSTRUCTION: Since the retrieved corpus yielded zero matching statutory provisions for this query, "
+            "provide an explicit statement declaring the lack of sufficient indexed evidence. "
+            "Do NOT fabricate section numbers or provisions from memory."
+        )
+    else:
+        user_message_content = (
+            f"STATUTORY & DOCUMENT EVIDENCE CONTEXT:\n{compiled_context}\n\n"
+            f"CLIENT LEGAL QUERY:\n{query_text}\n\n"
+            "Provide your grounded legal opinion based strictly on the exhibits above:"
+        )
 
     messages = [
         {"role": "system", "content": system_instruction},
         {"role": "user", "content": user_message_content},
     ]
 
-    # Dispatch to the chosen Nemotron model on Nebius Token Factory
     synthesized_answer = await nebius_client.create_chat_completion(
         model=selected_model,
         messages=messages,
-        temperature=0.2,
+        temperature=0.1 if (fallback_triggered or not included_chunks) else 0.2,
         max_tokens=3500,
     )
 
     return {
         "raw_answer": synthesized_answer,
+        "context_text": compiled_context,
+        "filtered_chunks": included_chunks,
     }
 
 
@@ -260,30 +374,45 @@ async def format_citations_node(
     """
     Validates, deduplicates, and formats citations into the final response payload.
     
-    Aligns retrieved chunks with verified statutory provisions.
+    Aligns citations strictly with the evidence chunks actually included in the generation context.
     """
     raw_answer = state.get("raw_answer", "")
-    retrieved_chunks = state.get("retrieved_chunks", [])
+    candidate_chunks = state.get("filtered_chunks")
+    if candidate_chunks is None:
+        candidate_chunks = state.get("retrieved_chunks", [])
 
     formatted_citations: list[dict[str, Any]] = []
     seen_provisions: set[str] = set()
 
-    for chunk in retrieved_chunks:
-        unique_key = f"{chunk['act_name']}::{chunk['section']}"
+    for chunk in candidate_chunks:
+        act_or_doc = (
+            chunk.get("act_name")
+            or chunk.get("document_name")
+            or chunk.get("document_id")
+            or "Unknown Statute"
+        ).strip()
+        section = (chunk.get("section") or chunk.get("heading") or "General Provision").strip()
+        unique_key = f"{act_or_doc.lower()}::{section.lower()}"
+
         if unique_key in seen_provisions:
             continue
         seen_provisions.add(unique_key)
 
         formatted_citations.append(
             {
-                "act_name": chunk["act_name"],
-                "section": chunk["section"],
+                "act_name": act_or_doc,
+                "section": section,
                 "sub_section": chunk.get("sub_section"),
-                "title": chunk.get("title"),
+                "title": chunk.get("title") or chunk.get("heading"),
                 "court_or_authority": chunk.get("court_or_authority"),
                 "citation_ref": chunk.get("citation_ref"),
-                "relevance_excerpt": chunk["content"][:300] + ("..." if len(chunk["content"]) > 300 else ""),
-                "similarity_score": round(chunk["similarity_score"], 4),
+                "relevance_excerpt": chunk.get("content", "")[:300] + ("..." if len(chunk.get("content", "")) > 300 else ""),
+                "similarity_score": round(float(chunk.get("similarity_score", 0.0)), 4),
+                "document_id": chunk.get("document_id"),
+                "document_name": chunk.get("document_name"),
+                "page_number": chunk.get("page_number"),
+                "heading": chunk.get("heading"),
+                "chunk_id": chunk.get("chunk_id"),
             }
         )
 
@@ -291,3 +420,4 @@ async def format_citations_node(
         "citations": formatted_citations,
         "final_answer": raw_answer,
     }
+

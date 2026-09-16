@@ -110,28 +110,40 @@ class QdrantClientWrapper:
         top_k: int = DEFAULT_TOP_K_RETRIEVAL,
         min_score: float = DEFAULT_MIN_SIMILARITY_SCORE,
         domain_filter: Optional[str] = None,
+        document_id_filter: Optional[str] = None,
     ) -> list[RetrievedStatutoryChunk]:
         """
         Executes dense vector similarity search against the pre-embedded legal corpus.
+        Supports compound filtering on domain and document_id.
         """
         logger.debug(
-            "Executing Qdrant vector search | collection: %s | top_k: %d | min_score: %.2f | domain: %s",
+            "Executing Qdrant vector search | collection: %s | top_k: %d | min_score: %.2f | domain: %s | doc_id: %s",
             self.settings.qdrant_collection_name,
             top_k,
             min_score,
             domain_filter,
+            document_id_filter,
         )
 
-        query_filter: Optional[models.Filter] = None
+        filter_conditions: list[models.FieldCondition] = []
         if domain_filter and domain_filter.strip():
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="domain",
-                        match=models.MatchValue(value=domain_filter.strip()),
-                    )
-                ]
+            filter_conditions.append(
+                models.FieldCondition(
+                    key="domain",
+                    match=models.MatchValue(value=domain_filter.strip()),
+                )
             )
+        if document_id_filter and document_id_filter.strip():
+            filter_conditions.append(
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=document_id_filter.strip()),
+                )
+            )
+
+        query_filter: Optional[models.Filter] = (
+            models.Filter(must=filter_conditions) if filter_conditions else None
+        )
 
         try:
             # We use search or query_points depending on qdrant-client version

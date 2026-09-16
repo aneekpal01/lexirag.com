@@ -55,6 +55,27 @@ class LegalCitation(BaseModel):
         le=1.0,
         description="Cosine similarity score produced by BGE-M3 dense vector search.",
     )
+    # Extended Phase 2 Evidence Metadata
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Originating document ID if retrieved from an ingested file.",
+    )
+    document_name: Optional[str] = Field(
+        default=None,
+        description="Filename of the ingested document.",
+    )
+    page_number: Optional[int] = Field(
+        default=None,
+        description="Page number in the original PDF/DOCX where this provision appears.",
+    )
+    heading: Optional[str] = Field(
+        default=None,
+        description="Heading or title extracted from the document structure.",
+    )
+    chunk_id: Optional[str] = Field(
+        default=None,
+        description="Deterministic chunk identifier from vector index.",
+    )
 
 
 class LegalQueryRequest(BaseModel):
@@ -72,6 +93,10 @@ class LegalQueryRequest(BaseModel):
     domain: Optional[str] = Field(
         default=None,
         description="Optional domain filter hint (e.g., 'corporate_law', 'taxation', 'employment_labor').",
+    )
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Optional document ID to scope retrieval to a specific ingested document.",
     )
     jurisdiction: str = Field(
         default="India",
@@ -114,4 +139,12 @@ class LegalQueryResponse(BaseModel):
     fallback_triggered: bool = Field(
         default=False,
         description="Indicates whether retrieval had no matching vectors and LLM operated with fallback instructions.",
+    )
+    detected_domain: Optional[str] = Field(
+        default=None,
+        description="Legal domain detected during classification or preserved from client request.",
+    )
+    filter_relaxed: bool = Field(
+        default=False,
+        description="Indicates whether an auto-inferred domain filter was relaxed to unconstrained search.",
     )

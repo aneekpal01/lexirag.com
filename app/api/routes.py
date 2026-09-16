@@ -61,6 +61,7 @@ async def query_legal_corpus(
     initial_state: LegalGraphState = {
         "query": request.query,
         "domain": request.domain,
+        "document_id": request.document_id,
         "jurisdiction": request.jurisdiction,
         "force_complex": request.force_complex_reasoning,
     }
@@ -82,6 +83,8 @@ async def query_legal_corpus(
         retrieved_chunks_count=len(final_state.get("retrieved_chunks", [])),
         execution_time_ms=round(elapsed_ms, 2),
         fallback_triggered=final_state.get("fallback_triggered", False),
+        detected_domain=final_state.get("detected_domain") or request.domain,
+        filter_relaxed=final_state.get("filter_relaxed", False),
     )
 
     logger.info(
