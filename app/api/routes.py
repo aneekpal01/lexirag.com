@@ -28,7 +28,12 @@ from app.schemas.ingestion import (
     DocumentStatusResponse,
     DocumentUploadResponse,
 )
-from app.schemas.query import LegalCitation, LegalQueryRequest, LegalQueryResponse
+from app.schemas.query import (
+    ClaimVerificationSummary,
+    LegalCitation,
+    LegalQueryRequest,
+    LegalQueryResponse,
+)
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["Legal Research RAG"])
@@ -75,6 +80,12 @@ async def query_legal_corpus(
     raw_citations = final_state.get("citations", [])
     structured_citations = [LegalCitation(**citation) for citation in raw_citations]
 
+    # Parse verification summary if present
+    verification_dict = final_state.get("verification_summary")
+    structured_verification = (
+        ClaimVerificationSummary(**verification_dict) if verification_dict else None
+    )
+
     response_payload = LegalQueryResponse(
         answer=final_state.get("final_answer", ""),
         citations=structured_citations,
@@ -87,6 +98,7 @@ async def query_legal_corpus(
         filter_relaxed=final_state.get("filter_relaxed", False),
         expansion_applied=final_state.get("expansion_applied", False),
         expansion_count=final_state.get("expansion_count", 0),
+        verification=structured_verification,
     )
 
     logger.info(

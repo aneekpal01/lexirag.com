@@ -17,9 +17,12 @@ from app.core.constants import (
     VALID_LEGAL_DOMAINS,
 )
 from app.core.logging import get_logger
+from app.rag.claim_extractor import DeterministicClaimExtractor
+from app.rag.claim_models import ClaimVerificationSummary, SupportStatus
 from app.rag.context import build_grounded_context_block, prune_chunks_by_score_margin
 from app.rag.expansion import ControlledEvidenceExpander
 from app.rag.state import LegalGraphState
+from app.rag.verifier import LegalEvidenceVerifier
 
 logger = get_logger(__name__)
 
@@ -387,7 +390,9 @@ async def generate_answer_node(
         "4. EXPLICIT EVIDENCE BOUNDARIES: If the provided exhibits partially answer the query, clearly demarcate what is "
         "substantiated by the evidence from what remains unsupported.\n"
         "5. FORMAL STRUCTURE: (a) Executive Conclusion, (b) Statutory / Contractual Analysis grounded in Exhibits, "
-        "(c) Compliance Implications & Practical Risks, (d) Evidentiary Scope & Limitations."
+        "(c) Compliance Implications & Practical Risks, (d) Evidentiary Scope & Limitations.\n"
+        "6. INLINE CITATIONS: For each substantive legal proposition derived from an exhibit, append the specific exhibit "
+        "reference tag directly inline (e.g., [EXHIBIT 1])."
     )
 
     if fallback_triggered or not included_chunks:
@@ -424,18 +429,119 @@ async def generate_answer_node(
     }
 
 
+async def verify_citations_node(
+    state: LegalGraphState,
+    settings: Optional[Settings] = None,
+    nebius_client: Optional[NebiusTokenFactoryClient] = None,
+) -> dict[str, Any]:
+    """
+    Extracts verifiable claims from synthesized answer, attributes them to exhibits,
+    and empirically audits evidentiary support against the indexed corpus.
+
+    Adheres strictly to the following principles:
+    - Anchors (section/numeric) validation is separated from support determination.
+    - Zero evidence queries preserve negative refusal and do not manufacture claims.
+    - Selective LLM verification is invoked only for ambiguous claims, never overriding hard contradictions.
+    - Unsupported claims are explicitly demarcated in final_answer without altering original text.
+    """
+    raw_answer = state.get("raw_answer", "")
+    included_chunks = state.get("filtered_chunks", [])
+    fallback_triggered = state.get("fallback_triggered", False)
+    current_settings = settings or get_settings()
+
+    # Mandatory Correction #10: If zero evidence or fallback triggered, preserve refusal and return empty metrics
+    if fallback_triggered or not included_chunks or not current_settings.enable_citation_verification:
+        logger.info(
+            "Bypassing citation verification (fallback=%s, chunks=%d, enabled=%s)",
+            fallback_triggered,
+            len(included_chunks),
+            current_settings.enable_citation_verification,
+        )
+        return {
+            "claims": [],
+            "verified_claims": [],
+            "unsupported_claims": [],
+            "verification_summary": {
+                "total_claims": 0,
+                "supported_claims": 0,
+                "partially_supported_claims": 0,
+                "unsupported_claims": 0,
+                "supported_claim_ratio": None,
+                "unsupported_claim_texts": [],
+                "has_conflicts": False,
+                "conflict_notes": [],
+            },
+            "final_answer": raw_answer,
+        }
+
+    # Step 1: Conservative Claim Extraction
+    extractor = DeterministicClaimExtractor(available_exhibits=included_chunks)
+    extracted_claims = extractor.extract_claims(raw_answer)
+
+    # Step 2: Evidence Support Verification (Two-tier with selective LLM fallback if configured)
+    verifier = LegalEvidenceVerifier(
+        included_chunks=included_chunks,
+        settings=current_settings,
+        nebius_client=nebius_client,
+    )
+    verified_claims, summary = await verifier.verify_claims(extracted_claims)
+
+    # Step 3: Hybrid Final Answer Handling (Mandatory Correction #12)
+    # If any claims are unsupported or partially supported, append an authoritative evidentiary notes block.
+    unsupported_claims_list = [
+        c for c in verified_claims if c.support_status != SupportStatus.SUPPORTED
+    ]
+    supported_claims_list = [
+        c for c in verified_claims if c.support_status == SupportStatus.SUPPORTED
+    ]
+
+    final_answer = raw_answer
+    if unsupported_claims_list or summary.has_conflicts:
+        notes: list[str] = ["\n\n**Evidentiary Limitations & Verification Notes:**"]
+        for unsupp in unsupported_claims_list:
+            aspects_str = f" ({'; '.join(unsupp.unsupported_aspects)})" if unsupp.unsupported_aspects else ""
+            notes.append(
+                f"\n- The assertion regarding '{unsupp.claim_text[:120]}...' was not substantiated by the "
+                f"retrieved corpus exhibits{aspects_str}."
+            )
+        for conf in summary.conflict_notes:
+            notes.append(f"\n- [Potential Conflict]: {conf}")
+        final_answer = f"{raw_answer}{''.join(notes)}"
+
+    logger.info(
+        "Citation verification node finished | total: %d | supported: %d | partial: %d | unsupported: %d | ratio: %s",
+        summary.total_claims,
+        summary.supported_claims,
+        summary.partially_supported_claims,
+        summary.unsupported_claims,
+        str(summary.supported_claim_ratio),
+    )
+
+    return {
+        "claims": [c.to_dict() for c in extracted_claims],
+        "verified_claims": [c.to_dict() for c in supported_claims_list],
+        "unsupported_claims": [c.to_dict() for c in unsupported_claims_list],
+        "verification_summary": summary.model_dump(),
+        "final_answer": final_answer,
+    }
+
+
 async def format_citations_node(
     state: LegalGraphState,
 ) -> dict[str, Any]:
     """
     Validates, deduplicates, and formats citations into the final response payload.
-    
+
     Aligns citations strictly with the evidence chunks actually included in the generation context.
     """
     raw_answer = state.get("raw_answer", "")
+    final_answer = state.get("final_answer", raw_answer)
     candidate_chunks = state.get("filtered_chunks")
     if candidate_chunks is None:
         candidate_chunks = state.get("retrieved_chunks", [])
+
+    verified_claims_list = state.get("verified_claims", [])
+    unsupported_claims_list = state.get("unsupported_claims", [])
 
     formatted_citations: list[dict[str, Any]] = []
     seen_provisions: set[str] = set()
@@ -457,6 +563,17 @@ async def format_citations_node(
         raw_score = chunk.get("similarity_score")
         sim_score = round(float(raw_score), 4) if raw_score is not None else None
 
+        # Resolve exhibit support status
+        exhibit_id = chunk.get("exhibit_id")
+        chunk_support_status = "SUPPORTED"
+        if verified_claims_list or unsupported_claims_list:
+            if any(exhibit_id in c.get("supporting_exhibits", []) for c in verified_claims_list):
+                chunk_support_status = "SUPPORTED"
+            elif any(exhibit_id in c.get("cited_exhibit_ids", []) for c in unsupported_claims_list):
+                chunk_support_status = "UNSUPPORTED"
+            else:
+                chunk_support_status = "PARTIALLY_SUPPORTED"
+
         formatted_citations.append(
             {
                 "act_name": act_or_doc,
@@ -473,11 +590,13 @@ async def format_citations_node(
                 "heading": chunk.get("heading"),
                 "chunk_id": chunk.get("chunk_id"),
                 "evidence_role": chunk.get("evidence_role", "primary"),
+                "exhibit_id": exhibit_id,
+                "support_status": chunk_support_status,
             }
         )
 
     return {
         "citations": formatted_citations,
-        "final_answer": raw_answer,
+        "final_answer": final_answer,
     }
 

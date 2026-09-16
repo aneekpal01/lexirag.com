@@ -44,6 +44,12 @@ class LegalGraphState(TypedDict, total=False):
     raw_answer: str
     juridical_reasoning: Optional[str]
 
+    # Phase 4 Citation Verification & Evidence Attribution Artifacts
+    claims: list[dict[str, Any]]
+    verified_claims: list[dict[str, Any]]
+    unsupported_claims: list[dict[str, Any]]
+    verification_summary: Optional[dict[str, Any]]
+
     # Citation formatting outputs
     citations: list[dict[str, Any]]
     final_answer: str

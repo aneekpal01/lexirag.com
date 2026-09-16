@@ -10,7 +10,9 @@ from app.core.constants import (
     DEFAULT_CHUNK_SIZE_CHARS,
     DEFAULT_EMBEDDING_BATCH_SIZE,
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_ENABLE_CITATION_VERIFICATION,
     DEFAULT_ENABLE_NEIGHBOR_EXPANSION,
+    DEFAULT_ENABLE_SELECTIVE_LLM_VERIFIER,
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_MAX_EXPANSION_DEPTH,
     DEFAULT_MAX_NEIGHBORS_PER_CHUNK,
@@ -26,6 +28,7 @@ from app.core.constants import (
     DEFAULT_TOP_K_COMPLEX,
     DEFAULT_TOP_K_RETRIEVAL,
     DEFAULT_TOP_K_SIMPLE,
+    DEFAULT_VERIFICATION_MIN_OVERLAP_RATIO,
     MAX_DOCUMENT_UPLOAD_SIZE_BYTES,
 )
 
@@ -159,6 +162,22 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
         description="Maximum total supporting neighbor chunks permitted across the query.",
+    )
+
+    # Phase 4 Citation Verification & Evidence Attribution Configuration
+    enable_citation_verification: bool = Field(
+        default=DEFAULT_ENABLE_CITATION_VERIFICATION,
+        description="Whether to execute claim extraction and citation verification against retrieved evidence.",
+    )
+    enable_selective_llm_verifier: bool = Field(
+        default=DEFAULT_ENABLE_SELECTIVE_LLM_VERIFIER,
+        description="Whether to run selective LLM verification as a fallback when deterministic verification is ambiguous.",
+    )
+    verification_min_overlap_ratio: float = Field(
+        default=DEFAULT_VERIFICATION_MIN_OVERLAP_RATIO,
+        ge=0.0,
+        le=1.0,
+        description="Minimum lexical/entity token overlap ratio heuristic for substantive support evaluation.",
     )
 
     # Clerk Authentication

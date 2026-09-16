@@ -216,8 +216,13 @@ def build_grounded_context_block(
             )
             break
 
+        chunk_entry = dict(chunk)
+        chunk_entry["exhibit_id"] = f"EXHIBIT_{exhibit_index}"
+        chunk_entry["exhibit_label"] = f"[EXHIBIT {exhibit_index}]"
+        chunk_entry["exhibit_num"] = exhibit_index
+
         exhibit_blocks.append(block)
-        included_chunks.append(chunk)
+        included_chunks.append(chunk_entry)
         current_char_count += block_len
         exhibit_index += 1
 

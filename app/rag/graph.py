@@ -14,6 +14,7 @@ from app.rag.nodes import (
     format_citations_node,
     generate_answer_node,
     retrieve_context_node,
+    verify_citations_node,
 )
 from app.rag.state import LegalGraphState
 
@@ -26,7 +27,7 @@ def build_legal_rag_graph(
     settings: Settings,
 ) -> CompiledStateGraph:
     """
-    Constructs and compiles the 5-stage LangGraph workflow with dependency-injected clients.
+    Constructs and compiles the 6-stage LangGraph workflow with dependency-injected clients.
     
     Pipeline Topology:
     [START] 
@@ -42,6 +43,9 @@ def build_legal_rag_graph(
        │
        ▼
     [generate_answer] (Routes to Nemotron-3-Nano or Super-120b)
+       │
+       ▼
+    [verify_citations] (Two-Tier Empirical Evidence Verification)
        │
        ▼
     [format_citations] (Indian statutory & precedent formatting)
@@ -64,6 +68,9 @@ def build_legal_rag_graph(
     async def bound_generate_node(state: LegalGraphState) -> dict[str, Any]:
         return await generate_answer_node(state, nebius_client)
 
+    async def bound_verify_node(state: LegalGraphState) -> dict[str, Any]:
+        return await verify_citations_node(state, settings, nebius_client)
+
     async def bound_format_citations_node(state: LegalGraphState) -> dict[str, Any]:
         return await format_citations_node(state)
 
@@ -72,6 +79,7 @@ def build_legal_rag_graph(
     graph_builder.add_node("retrieve_context", bound_retrieve_node)
     graph_builder.add_node("expand_evidence_graph", bound_expand_node)
     graph_builder.add_node("generate_answer", bound_generate_node)
+    graph_builder.add_node("verify_citations", bound_verify_node)
     graph_builder.add_node("format_citations", bound_format_citations_node)
 
     # Define linear graph edges
@@ -79,7 +87,8 @@ def build_legal_rag_graph(
     graph_builder.add_edge("classify_query", "retrieve_context")
     graph_builder.add_edge("retrieve_context", "expand_evidence_graph")
     graph_builder.add_edge("expand_evidence_graph", "generate_answer")
-    graph_builder.add_edge("generate_answer", "format_citations")
+    graph_builder.add_edge("generate_answer", "verify_citations")
+    graph_builder.add_edge("verify_citations", "format_citations")
     graph_builder.add_edge("format_citations", END)
 
     compiled_graph = graph_builder.compile()

@@ -8,6 +8,7 @@ from app.core.constants import (
     MIN_QUERY_CHARACTER_LENGTH,
     VALID_LEGAL_DOMAINS,
 )
+from app.rag.claim_models import ClaimVerificationSummary
 
 QueryComplexity = Literal["simple", "complex"]
 
@@ -79,6 +80,14 @@ class LegalCitation(BaseModel):
     evidence_role: Optional[str] = Field(
         default="primary",
         description="Role of evidence in research graph: 'primary' (direct vector hit) or 'supporting' (neighboring expansion).",
+    )
+    exhibit_id: Optional[str] = Field(
+        default=None,
+        description="Assigned context exhibit identifier (e.g., 'EXHIBIT_1').",
+    )
+    support_status: Optional[str] = Field(
+        default="SUPPORTED",
+        description="Empirical evidence support status: 'SUPPORTED', 'PARTIALLY_SUPPORTED', or 'UNSUPPORTED'.",
     )
 
 
@@ -159,4 +168,8 @@ class LegalQueryResponse(BaseModel):
     expansion_count: int = Field(
         default=0,
         description="Total neighboring supporting chunks added to context.",
+    )
+    verification: Optional[ClaimVerificationSummary] = Field(
+        default=None,
+        description="Empirical citation verification and claim attribution audit.",
     )
