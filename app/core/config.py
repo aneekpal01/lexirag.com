@@ -10,7 +10,12 @@ from app.core.constants import (
     DEFAULT_CHUNK_SIZE_CHARS,
     DEFAULT_EMBEDDING_BATCH_SIZE,
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_ENABLE_NEIGHBOR_EXPANSION,
     DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_EXPANSION_DEPTH,
+    DEFAULT_MAX_NEIGHBORS_PER_CHUNK,
+    DEFAULT_MAX_PRIMARY_CHUNKS_TO_EXPAND,
+    DEFAULT_MAX_TOTAL_EXPANDED_CHUNKS,
     DEFAULT_MIN_SCORE_COMPLEX,
     DEFAULT_MIN_SCORE_SIMPLE,
     DEFAULT_MIN_SIMILARITY_SCORE,
@@ -124,6 +129,36 @@ class Settings(BaseSettings):
         ge=500,
         le=50000,
         description="Maximum total characters permitted in compiled legal context block.",
+    )
+
+    # Phase 3 Evidence Graph & Neighbor Expansion Configuration
+    enable_neighbor_expansion: bool = Field(
+        default=DEFAULT_ENABLE_NEIGHBOR_EXPANSION,
+        description="Whether to perform controlled neighboring chunk expansion on retrieved evidence.",
+    )
+    max_expansion_depth: int = Field(
+        default=DEFAULT_MAX_EXPANSION_DEPTH,
+        ge=1,
+        le=1,
+        description="Maximum expansion depth from primary chunks (strictly 1 in Phase 3).",
+    )
+    max_neighbors_per_chunk: int = Field(
+        default=DEFAULT_MAX_NEIGHBORS_PER_CHUNK,
+        ge=1,
+        le=2,
+        description="Maximum neighbor chunks to retrieve per primary chunk (previous + next).",
+    )
+    max_primary_chunks_to_expand: int = Field(
+        default=DEFAULT_MAX_PRIMARY_CHUNKS_TO_EXPAND,
+        ge=1,
+        le=5,
+        description="Maximum number of top primary chunks eligible for neighbor expansion.",
+    )
+    max_total_expanded_chunks: int = Field(
+        default=DEFAULT_MAX_TOTAL_EXPANDED_CHUNKS,
+        ge=1,
+        le=10,
+        description="Maximum total supporting neighbor chunks permitted across the query.",
     )
 
     # Clerk Authentication

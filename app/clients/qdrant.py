@@ -32,7 +32,7 @@ class RetrievedStatutoryChunk(BaseModel):
     citation_ref: Optional[str] = None
     content: str
     domain: Optional[str] = None
-    similarity_score: float
+    similarity_score: Optional[float] = None
 
     # Extended Phase 1 Document Metadata
     document_id: Optional[str] = None
@@ -42,6 +42,10 @@ class RetrievedStatutoryChunk(BaseModel):
     heading: Optional[str] = None
     file_type: Optional[str] = None
     chunk_index: Optional[int] = None
+
+    # Phase 3 Adjacency Graph Pointers
+    prev_chunk_id: Optional[str] = None
+    next_chunk_id: Optional[str] = None
 
 
 class QdrantClientWrapper:
@@ -55,7 +59,12 @@ class QdrantClientWrapper:
             timeout=QDRANT_REQUEST_TIMEOUT_SECONDS,
         )
 
-    def _parse_payload(self, point_id: Any, payload: Optional[dict[str, Any]], score: float) -> RetrievedStatutoryChunk:
+    def _parse_payload(
+        self,
+        point_id: Any,
+        payload: Optional[dict[str, Any]],
+        score: Optional[float] = None,
+    ) -> RetrievedStatutoryChunk:
         """
         Extracts statutory fields defensively to prevent failures on malformed vectors.
         Supports both statutory chunks and newly ingested general legal documents.
@@ -94,7 +103,7 @@ class QdrantClientWrapper:
             citation_ref=payload.get("citation_ref") or payload.get("citation"),
             content=str(content).strip(),
             domain=payload.get("domain"),
-            similarity_score=float(score),
+            similarity_score=float(score) if score is not None else None,
             document_id=payload.get("document_id"),
             document_name=payload.get("document_name"),
             source=payload.get("source"),
@@ -102,6 +111,8 @@ class QdrantClientWrapper:
             heading=payload.get("heading"),
             file_type=payload.get("file_type"),
             chunk_index=payload.get("chunk_index"),
+            prev_chunk_id=payload.get("prev_chunk_id"),
+            next_chunk_id=payload.get("next_chunk_id"),
         )
 
     async def search_statutes(
@@ -294,6 +305,43 @@ class QdrantClientWrapper:
         except Exception as exc:
             logger.warning("Failed to scroll document points for '%s': %s", document_id, exc)
             return []
+
+    async def get_chunks_by_ids(
+        self,
+        chunk_ids: list[str],
+        collection_name: Optional[str] = None,
+    ) -> list[RetrievedStatutoryChunk]:
+        """
+        Directly retrieves specific vector points by deterministic point IDs without vector search.
+        Qdrant direct point-ID retrieval avoids vector similarity search for known neighboring chunk IDs.
+        """
+        if not chunk_ids:
+            return []
+        target_name = collection_name or self.settings.qdrant_collection_name
+        try:
+            points = await self.client.retrieve(
+                collection_name=target_name,
+                ids=chunk_ids,
+                with_payload=True,
+                with_vectors=False,
+            )
+            chunks: list[RetrievedStatutoryChunk] = []
+            for point in points:
+                try:
+                    chunk = self._parse_payload(
+                        point_id=point.id,
+                        payload=point.payload,
+                        score=None,
+                    )
+                    chunks.append(chunk)
+                except MalformedQdrantPayloadError as err:
+                    logger.warning("Skipping malformed neighbor chunk point %s: %s", point.id, err.message)
+                    continue
+            logger.debug("Retrieved %d / %d chunks by point IDs from collection '%s'", len(chunks), len(chunk_ids), target_name)
+            return chunks
+        except Exception as exc:
+            logger.error("Failed to retrieve points by ID from Qdrant: %s", exc)
+            raise QdrantServiceError(f"Point lookup by ID failed: {exc}") from exc
 
     async def check_health(self) -> bool:
         """Verifies connectivity to Qdrant cluster and existence of target collection."""

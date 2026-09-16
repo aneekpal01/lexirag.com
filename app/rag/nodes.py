@@ -18,6 +18,7 @@ from app.core.constants import (
 )
 from app.core.logging import get_logger
 from app.rag.context import build_grounded_context_block, prune_chunks_by_score_margin
+from app.rag.expansion import ControlledEvidenceExpander
 from app.rag.state import LegalGraphState
 
 logger = get_logger(__name__)
@@ -288,6 +289,61 @@ async def retrieve_context_node(
     }
 
 
+async def expand_evidence_graph_node(
+    state: LegalGraphState,
+    qdrant_wrapper: QdrantClientWrapper,
+    settings: Settings,
+) -> dict[str, Any]:
+    """
+    Constructs an in-memory query-local Evidence Graph and expands primary retrieval
+    evidence with direct neighboring chunks (depth=1).
+    
+    Enforces strict document isolation, bounded expansion limits, and graceful degradation.
+    Bypasses expansion if primary evidence is empty.
+    """
+    filtered_chunks = state.get("filtered_chunks", [])
+    fallback_triggered = state.get("fallback_triggered", False)
+    explicit_document_id = state.get("document_id")
+
+    # If zero primary chunks retrieved or fallback triggered, bypass expansion entirely
+    if fallback_triggered or not filtered_chunks:
+        logger.info("Zero primary evidence chunks; bypassing evidence graph expansion.")
+        return {
+            "expanded_chunks": [],
+            "evidence_graph": None,
+            "expansion_applied": False,
+            "expansion_count": 0,
+        }
+
+    expander = ControlledEvidenceExpander(qdrant_wrapper=qdrant_wrapper, settings=settings)
+    graph = await expander.expand_evidence(
+        primary_chunks=filtered_chunks,
+        explicit_document_id=explicit_document_id,
+    )
+
+    supporting_nodes = graph.get_supporting_nodes()
+    expanded_chunks_list = [node.to_chunk_dict() for node in supporting_nodes]
+    all_nodes_list = [node.to_chunk_dict() for node in graph.nodes.values()]
+
+    expansion_applied = len(expanded_chunks_list) > 0
+    expansion_count = len(expanded_chunks_list)
+
+    logger.info(
+        "Evidence graph node completed | primary: %d | expanded: %d | total_graph_nodes: %d",
+        len(graph.get_primary_nodes()),
+        expansion_count,
+        len(graph.nodes),
+    )
+
+    return {
+        "filtered_chunks": all_nodes_list,
+        "expanded_chunks": expanded_chunks_list,
+        "evidence_graph": graph.to_diagnostics_dict(),
+        "expansion_applied": expansion_applied,
+        "expansion_count": expansion_count,
+    }
+
+
 async def generate_answer_node(
     state: LegalGraphState,
     nebius_client: NebiusTokenFactoryClient,
@@ -398,6 +454,9 @@ async def format_citations_node(
             continue
         seen_provisions.add(unique_key)
 
+        raw_score = chunk.get("similarity_score")
+        sim_score = round(float(raw_score), 4) if raw_score is not None else None
+
         formatted_citations.append(
             {
                 "act_name": act_or_doc,
@@ -407,12 +466,13 @@ async def format_citations_node(
                 "court_or_authority": chunk.get("court_or_authority"),
                 "citation_ref": chunk.get("citation_ref"),
                 "relevance_excerpt": chunk.get("content", "")[:300] + ("..." if len(chunk.get("content", "")) > 300 else ""),
-                "similarity_score": round(float(chunk.get("similarity_score", 0.0)), 4),
+                "similarity_score": sim_score,
                 "document_id": chunk.get("document_id"),
                 "document_name": chunk.get("document_name"),
                 "page_number": chunk.get("page_number"),
                 "heading": chunk.get("heading"),
                 "chunk_id": chunk.get("chunk_id"),
+                "evidence_role": chunk.get("evidence_role", "primary"),
             }
         )
 

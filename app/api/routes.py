@@ -85,6 +85,8 @@ async def query_legal_corpus(
         fallback_triggered=final_state.get("fallback_triggered", False),
         detected_domain=final_state.get("detected_domain") or request.domain,
         filter_relaxed=final_state.get("filter_relaxed", False),
+        expansion_applied=final_state.get("expansion_applied", False),
+        expansion_count=final_state.get("expansion_count", 0),
     )
 
     logger.info(

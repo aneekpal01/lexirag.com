@@ -54,9 +54,10 @@ def deduplicate_evidence_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, 
     
     Keyed by normalized (document_or_act, section_or_heading).
     When duplicates exist:
-    - Retains the highest similarity score.
+    - Retains primary evidence role over supporting role.
+    - Retains the highest similarity score if present.
     - Merges unique supplementary text if distinct.
-    - Preserves metadata (document_id, page_number, heading, domain).
+    - Preserves metadata (document_id, page_number, heading, domain, expansion_reason).
     """
     if not chunks:
         return []
@@ -83,11 +84,17 @@ def deduplicate_evidence_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, 
             deduped_map[key] = dict(chunk)
         else:
             existing = deduped_map[key]
-            existing_score = float(existing.get("similarity_score", 0.0))
-            new_score = float(chunk.get("similarity_score", 0.0))
 
-            if new_score > existing_score:
-                existing["similarity_score"] = new_score
+            # Primary role always supersedes supporting role
+            if chunk.get("evidence_role") == "primary":
+                existing["evidence_role"] = "primary"
+
+            # Retain valid similarity score
+            new_score = chunk.get("similarity_score")
+            existing_score = existing.get("similarity_score")
+            if new_score is not None:
+                if existing_score is None or float(new_score) > float(existing_score):
+                    existing["similarity_score"] = float(new_score)
 
             # If the duplicate chunk contains non-overlapping text, append it
             existing_content = existing.get("content", "").strip()
@@ -95,11 +102,13 @@ def deduplicate_evidence_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, 
             if new_content and new_content not in existing_content:
                 existing["content"] = f"{existing_content}\n\n[Additional Excerpt]:\n{new_content}"
 
-            # Preserve page numbers or sub-sections if missing in original
+            # Preserve page numbers, sub-sections, or expansion details if missing in original
             if not existing.get("page_number") and chunk.get("page_number"):
                 existing["page_number"] = chunk.get("page_number")
             if not existing.get("sub_section") and chunk.get("sub_section"):
                 existing["sub_section"] = chunk.get("sub_section")
+            if not existing.get("expansion_reason") and chunk.get("expansion_reason"):
+                existing["expansion_reason"] = chunk.get("expansion_reason")
 
     deduped_list = list(deduped_map.values())
     logger.debug("Evidence deduplication | input: %d | unique: %d", len(chunks), len(deduped_list))
@@ -128,7 +137,8 @@ def build_grounded_context_block(
     """
     Assembles evidence chunks into structured, exhibition-labeled context for Nemotron.
     
-    Applies strict context character budgeting to prevent prompt bloat.
+    Priority Budgeting: Primary evidence receives guaranteed priority; supporting
+    neighbor context consumes remaining character headroom only.
     Returns:
         (compiled_context_string, list_of_retained_chunks_used_in_context)
     """
@@ -140,50 +150,76 @@ def build_grounded_context_block(
         )
 
     deduped = deduplicate_evidence_chunks(chunks)
-    grouped = group_evidence_hierarchically(deduped)
+
+    # Order candidates: primary evidence first, followed by supporting context
+    primary_chunks = [c for c in deduped if c.get("evidence_role") == "primary" or not c.get("evidence_role")]
+    supporting_chunks = [c for c in deduped if c.get("evidence_role") and c.get("evidence_role") != "primary"]
+    ordered_candidates = primary_chunks + supporting_chunks
 
     exhibit_index = 1
     exhibit_blocks: list[str] = []
     included_chunks: list[dict[str, Any]] = []
     current_char_count = 0
 
-    for source_name, source_chunks in grouped.items():
-        for chunk in source_chunks:
-            section_label = chunk.get("section") or chunk.get("heading") or "General Provision"
-            score = float(chunk.get("similarity_score", 0.0))
+    for chunk in ordered_candidates:
+        source_name = (
+            chunk.get("act_name")
+            or chunk.get("document_name")
+            or "Statutory Authority"
+        ).strip()
+        section_label = chunk.get("section") or chunk.get("heading") or "General Provision"
+        role_val = chunk.get("evidence_role", "primary")
 
-            header_lines = [f"[EXHIBIT {exhibit_index}] Source: {source_name} | Provision: {section_label}"]
+        # Determine human-readable role and score representation
+        if role_val == "supporting_prev":
+            role_desc = "Supporting Context (Sequential Predecessor)"
+            score_desc = "Structural Context (No Vector Score)"
+        elif role_val == "supporting_next":
+            role_desc = "Supporting Context (Sequential Successor)"
+            score_desc = "Structural Context (No Vector Score)"
+        elif role_val != "primary":
+            role_desc = "Supporting Context"
+            score_desc = "Structural Context (No Vector Score)"
+        else:
+            role_desc = "Primary Evidence"
+            raw_score = chunk.get("similarity_score")
+            score_desc = f"{float(raw_score):.4f}" if raw_score is not None else "Direct Match"
 
-            meta_details = []
-            if chunk.get("title"):
-                meta_details.append(f"Title: {chunk['title']}")
-            if chunk.get("page_number"):
-                meta_details.append(f"Page: {chunk['page_number']}")
-            if chunk.get("domain"):
-                meta_details.append(f"Domain: {chunk['domain']}")
-            meta_details.append(f"Match Score: {score:.4f}")
+        header_lines = [f"[EXHIBIT {exhibit_index}] Source: {source_name} | Provision: {section_label}"]
 
-            if meta_details:
-                header_lines.append(" | ".join(meta_details))
+        meta_details = [f"Role: {role_desc}"]
+        if chunk.get("title"):
+            meta_details.append(f"Title: {chunk['title']}")
+        if chunk.get("page_number"):
+            meta_details.append(f"Page: {chunk['page_number']}")
+        if chunk.get("domain"):
+            meta_details.append(f"Domain: {chunk['domain']}")
+        meta_details.append(f"Match Score: {score_desc}")
+        if chunk.get("expansion_reason"):
+            meta_details.append(f"Expansion Note: {chunk['expansion_reason']}")
 
-            header = "\n".join(header_lines)
-            content = chunk.get("content", "").strip()
-            block = f"{header}\nVERBATIM PROVISION:\n{content}\n"
+        if meta_details:
+            header_lines.append(" | ".join(meta_details))
 
-            block_len = len(block)
-            if current_char_count + block_len > max_chars and included_chunks:
-                logger.warning(
-                    "Context character budget reached (%d / %d chars). Truncating remaining %d exhibits.",
-                    current_char_count,
-                    max_chars,
-                    len(deduped) - len(included_chunks),
-                )
-                break
+        header = "\n".join(header_lines)
+        content = chunk.get("content", "").strip()
+        block = f"{header}\nVERBATIM PROVISION:\n{content}\n"
 
-            exhibit_blocks.append(block)
-            included_chunks.append(chunk)
-            current_char_count += block_len
-            exhibit_index += 1
+        block_len = len(block)
+        if current_char_count + block_len > max_chars and included_chunks:
+            logger.warning(
+                "Context character budget reached (%d / %d chars). Truncating remaining %d exhibits (role: %s).",
+                current_char_count,
+                max_chars,
+                len(ordered_candidates) - len(included_chunks),
+                role_desc,
+            )
+            break
+
+        exhibit_blocks.append(block)
+        included_chunks.append(chunk)
+        current_char_count += block_len
+        exhibit_index += 1
 
     compiled_context = "\n---\n".join(exhibit_blocks)
     return compiled_context, included_chunks

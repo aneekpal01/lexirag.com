@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.rag.nodes import (
     classify_query_node,
+    expand_evidence_graph_node,
     format_citations_node,
     generate_answer_node,
     retrieve_context_node,
@@ -25,7 +26,7 @@ def build_legal_rag_graph(
     settings: Settings,
 ) -> CompiledStateGraph:
     """
-    Constructs and compiles the 4-stage LangGraph workflow with dependency-injected clients.
+    Constructs and compiles the 5-stage LangGraph workflow with dependency-injected clients.
     
     Pipeline Topology:
     [START] 
@@ -35,6 +36,9 @@ def build_legal_rag_graph(
        │
        ▼
     [retrieve_context] (BGE-M3 + Qdrant Cloud)
+       │
+       ▼
+    [expand_evidence_graph] (Controlled Structural Expansion)
        │
        ▼
     [generate_answer] (Routes to Nemotron-3-Nano or Super-120b)
@@ -54,6 +58,9 @@ def build_legal_rag_graph(
     async def bound_retrieve_node(state: LegalGraphState) -> dict[str, Any]:
         return await retrieve_context_node(state, nebius_client, qdrant_wrapper, settings)
 
+    async def bound_expand_node(state: LegalGraphState) -> dict[str, Any]:
+        return await expand_evidence_graph_node(state, qdrant_wrapper, settings)
+
     async def bound_generate_node(state: LegalGraphState) -> dict[str, Any]:
         return await generate_answer_node(state, nebius_client)
 
@@ -63,13 +70,15 @@ def build_legal_rag_graph(
     # Register workflow nodes
     graph_builder.add_node("classify_query", bound_classify_node)
     graph_builder.add_node("retrieve_context", bound_retrieve_node)
+    graph_builder.add_node("expand_evidence_graph", bound_expand_node)
     graph_builder.add_node("generate_answer", bound_generate_node)
     graph_builder.add_node("format_citations", bound_format_citations_node)
 
     # Define linear graph edges
     graph_builder.add_edge(START, "classify_query")
     graph_builder.add_edge("classify_query", "retrieve_context")
-    graph_builder.add_edge("retrieve_context", "generate_answer")
+    graph_builder.add_edge("retrieve_context", "expand_evidence_graph")
+    graph_builder.add_edge("expand_evidence_graph", "generate_answer")
     graph_builder.add_edge("generate_answer", "format_citations")
     graph_builder.add_edge("format_citations", END)
 

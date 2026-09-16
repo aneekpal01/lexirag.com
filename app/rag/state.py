@@ -34,6 +34,12 @@ class LegalGraphState(TypedDict, total=False):
     fallback_triggered: bool
     filter_relaxed: bool
 
+    # Phase 3 Evidence Graph & Expansion Artifacts
+    expanded_chunks: list[dict[str, Any]]
+    evidence_graph: Optional[dict[str, Any]]
+    expansion_applied: bool
+    expansion_count: int
+
     # Generation & reasoning outputs
     raw_answer: str
     juridical_reasoning: Optional[str]

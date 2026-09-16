@@ -49,13 +49,13 @@ class LegalCitation(BaseModel):
         ...,
         description="Direct verbatim snippet from the retrieved statutory text grounding the advice.",
     )
-    similarity_score: float = Field(
-        ...,
+    similarity_score: Optional[float] = Field(
+        default=None,
         ge=0.0,
         le=1.0,
-        description="Cosine similarity score produced by BGE-M3 dense vector search.",
+        description="Cosine similarity score for primary vector hits; None for supporting neighbor chunks.",
     )
-    # Extended Phase 2 Evidence Metadata
+    # Extended Evidence Metadata
     document_id: Optional[str] = Field(
         default=None,
         description="Originating document ID if retrieved from an ingested file.",
@@ -75,6 +75,10 @@ class LegalCitation(BaseModel):
     chunk_id: Optional[str] = Field(
         default=None,
         description="Deterministic chunk identifier from vector index.",
+    )
+    evidence_role: Optional[str] = Field(
+        default="primary",
+        description="Role of evidence in research graph: 'primary' (direct vector hit) or 'supporting' (neighboring expansion).",
     )
 
 
@@ -147,4 +151,12 @@ class LegalQueryResponse(BaseModel):
     filter_relaxed: bool = Field(
         default=False,
         description="Indicates whether an auto-inferred domain filter was relaxed to unconstrained search.",
+    )
+    expansion_applied: bool = Field(
+        default=False,
+        description="Indicates whether structural neighboring chunk expansion was applied.",
+    )
+    expansion_count: int = Field(
+        default=0,
+        description="Total neighboring supporting chunks added to context.",
     )
