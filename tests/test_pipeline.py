@@ -208,3 +208,48 @@ async def test_end_to_end_graph(mock_nebius_client, mock_qdrant_wrapper, mock_se
     assert "Under Section 185" in final_state["final_answer"]
     assert len(final_state["citations"]) == 1
     assert final_state["citations"][0]["section"] == "Section 185"
+
+
+@pytest.mark.asyncio
+async def test_qdrant_wrapper_applies_domain_filter(mock_settings):
+    mock_async_qdrant = MagicMock()
+    mock_point = MagicMock()
+    mock_point.id = "p-1"
+    mock_point.score = 0.95
+    mock_point.payload = {
+        "act_name": "Income Tax Act, 1961",
+        "section": "Section 148",
+        "content": "Notice for reassessment of income.",
+        "domain": "taxation",
+    }
+    mock_async_qdrant.search = AsyncMock(return_value=[mock_point])
+
+    wrapper = QdrantClientWrapper(settings=mock_settings, client=mock_async_qdrant)
+    chunks = await wrapper.search_statutes(
+        query_vector=[0.05] * 1024,
+        domain_filter="taxation",
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].section == "Section 148"
+    mock_async_qdrant.search.assert_called_once()
+    call_kwargs = mock_async_qdrant.search.call_args.kwargs
+    query_filter = call_kwargs.get("query_filter")
+    assert query_filter is not None
+    assert query_filter.must[0].key == "domain"
+    assert query_filter.must[0].match.value == "taxation"
+
+
+@pytest.mark.asyncio
+async def test_qdrant_wrapper_preserves_none_filter(mock_settings):
+    mock_async_qdrant = MagicMock()
+    mock_async_qdrant.search = AsyncMock(return_value=[])
+
+    wrapper = QdrantClientWrapper(settings=mock_settings, client=mock_async_qdrant)
+    await wrapper.search_statutes(
+        query_vector=[0.05] * 1024,
+        domain_filter=None,
+    )
+
+    call_kwargs = mock_async_qdrant.search.call_args.kwargs
+    assert call_kwargs.get("query_filter") is None

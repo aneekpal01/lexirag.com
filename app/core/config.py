@@ -2,16 +2,20 @@
 
 from functools import lru_cache
 from typing import Literal
-from pydantic import Field, HttpUrl, field_validator
+from pydantic import Field, HttpUrl, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.constants import (
+    DEFAULT_CHUNK_OVERLAP_CHARS,
+    DEFAULT_CHUNK_SIZE_CHARS,
+    DEFAULT_EMBEDDING_BATCH_SIZE,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_MIN_SIMILARITY_SCORE,
     DEFAULT_NEBIUS_BASE_URL,
     DEFAULT_NEMOTRON_NANO_MODEL,
     DEFAULT_NEMOTRON_SUPER_MODEL,
     DEFAULT_TOP_K_RETRIEVAL,
+    MAX_DOCUMENT_UPLOAD_SIZE_BYTES,
 )
 
 
@@ -94,6 +98,36 @@ class Settings(BaseSettings):
         description="Optional Clerk PEM public key for offline JWT verification.",
     )
 
+    # CORS Configuration
+    cors_origins: list[str] = Field(
+        default=["http://localhost:3000", "http://127.0.0.1:3000"],
+        description="Allowed CORS origins for web frontend clients.",
+    )
+
+    # Document Ingestion & Chunking Configuration
+    max_upload_size_bytes: int = Field(
+        default=MAX_DOCUMENT_UPLOAD_SIZE_BYTES,
+        description="Maximum inbound file size permitted for document ingestion (25 MB).",
+    )
+    chunk_size_chars: int = Field(
+        default=DEFAULT_CHUNK_SIZE_CHARS,
+        ge=200,
+        le=4000,
+        description="Target character size constraint per chunk.",
+    )
+    chunk_overlap_chars: int = Field(
+        default=DEFAULT_CHUNK_OVERLAP_CHARS,
+        ge=0,
+        le=1000,
+        description="Overlapping characters between contiguous document chunks.",
+    )
+    embedding_batch_size: int = Field(
+        default=DEFAULT_EMBEDDING_BATCH_SIZE,
+        ge=1,
+        le=64,
+        description="Batch size for concurrent array embeddings sent to Nebius Token Factory.",
+    )
+
     @field_validator("nebius_base_url")
     @classmethod
     def ensure_trailing_slash(cls, value: str) -> str:
@@ -101,6 +135,15 @@ class Settings(BaseSettings):
         if not value.endswith("/"):
             return f"{value}/"
         return value
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> "Settings":
+        """Disallow insecure development overrides when deployed in production."""
+        if self.environment == "production" and self.clerk_dev_mode:
+            raise ValueError(
+                "Security violation: 'clerk_dev_mode' cannot be enabled when 'environment' is 'production'."
+            )
+        return self
 
 
 @lru_cache

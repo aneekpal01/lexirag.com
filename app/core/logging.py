@@ -1,13 +1,30 @@
 """Centralized logging configuration for LexiRAG."""
 
+from contextvars import ContextVar
 import logging
 import sys
+
+# Global request ID context variable for coroutine-safe tracing
+request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+def get_current_request_id() -> str:
+    """Returns the correlation ID of the active HTTP request, or '-' if outside request scope."""
+    return request_id_ctx.get()
+
+
+class RequestIdLogFilter(logging.Filter):
+    """Injects the active request correlation ID into every log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = get_current_request_id()
+        return True
 
 
 def setup_application_logging(log_level: str = "INFO") -> None:
     """Configures structured console logging across all service modules."""
     log_format = (
-        "%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
+        "%(asctime)s | %(levelname)-8s | [%(request_id)s] %(name)s:%(funcName)s:%(lineno)d - %(message)s"
     )
     date_format = "%Y-%m-%dT%H:%M:%S"
 
@@ -22,7 +39,11 @@ def setup_application_logging(log_level: str = "INFO") -> None:
         console_handler.setLevel(numeric_level)
         formatter = logging.Formatter(fmt=log_format, datefmt=date_format)
         console_handler.setFormatter(formatter)
+        console_handler.addFilter(RequestIdLogFilter())
         root_logger.addHandler(console_handler)
+    else:
+        for handler in root_logger.handlers:
+            handler.addFilter(RequestIdLogFilter())
 
     # Quiet external verbose libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)

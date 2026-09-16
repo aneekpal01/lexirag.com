@@ -1,16 +1,33 @@
 """HTTP route controllers for the LexiRAG backend service."""
 
 import time
-from typing import Any
-from fastapi import APIRouter, Depends, status
+from typing import Any, Optional
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from langgraph.graph.state import CompiledStateGraph
 
-from app.api.dependencies import get_compiled_graph, get_qdrant_wrapper
+from app.api.dependencies import (
+    get_compiled_graph,
+    get_ingestion_pipeline,
+    get_qdrant_wrapper,
+)
 from app.auth.clerk import AuthenticatedUser, verify_clerk_token
 from app.clients.qdrant import QdrantClientWrapper
 from app.core.config import Settings, get_settings
+from app.core.constants import ALLOWED_DOCUMENT_EXTENSIONS
+from app.core.exceptions import (
+    DocumentNotFoundError,
+    DocumentPayloadTooLargeError,
+    EmptyDocumentError,
+    InvalidDocumentError,
+)
 from app.core.logging import get_logger
+from app.ingestion.pipeline import DocumentIngestionPipeline
 from app.rag.state import LegalGraphState
+from app.schemas.ingestion import (
+    DocumentDeleteResponse,
+    DocumentStatusResponse,
+    DocumentUploadResponse,
+)
 from app.schemas.query import LegalCitation, LegalQueryRequest, LegalQueryResponse
 
 logger = get_logger(__name__)
@@ -111,3 +128,121 @@ async def health_check(
             "clerk_dev_mode": settings.clerk_dev_mode,
         },
     }
+
+
+# ==============================================================================
+# Document Ingestion & Corpus Management Routes (Phase 1)
+# ==============================================================================
+
+
+@router.post(
+    "/documents/upload",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload and Index Legal Document",
+    description=(
+        "Uploads a PDF, DOCX, or TXT document up to 25 MB. Computes canonical SHA-256 hash, "
+        "detects legal structural boundaries (Sections, Clauses, Articles), generates BAAI/bge-m3 "
+        "dense vectors via Nebius Token Factory, and indexes chunks into Qdrant Cloud."
+    ),
+)
+async def upload_document(
+    file: UploadFile = File(..., description="Document file to ingest (.pdf, .docx, .txt)."),
+    domain: Optional[str] = Form(default=None, description="Optional legal domain tag."),
+    pipeline: DocumentIngestionPipeline = Depends(get_ingestion_pipeline),
+    current_user: AuthenticatedUser = Depends(verify_clerk_token),
+) -> DocumentUploadResponse:
+    """Ingests, parses, chunks, embeds, and indexes a legal document into Qdrant."""
+    filename = file.filename or "unknown_document"
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if extension not in ALLOWED_DOCUMENT_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file format '{extension}'. Permitted formats: {', '.join(ALLOWED_DOCUMENT_EXTENSIONS)}",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Uploaded file is empty (0 bytes).",
+        )
+
+    receipt = await pipeline.ingest_document(
+        file_bytes=file_bytes,
+        raw_filename=filename,
+        domain=domain,
+    )
+    return receipt
+
+
+@router.get(
+    "/documents/{document_id}",
+    response_model=DocumentStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Retrieve Indexed Document Status",
+    description="Fetches indexing status and chunk breakdowns for a previously ingested document.",
+)
+async def get_document_status(
+    document_id: str,
+    qdrant: QdrantClientWrapper = Depends(get_qdrant_wrapper),
+    current_user: AuthenticatedUser = Depends(verify_clerk_token),
+) -> DocumentStatusResponse:
+    """Checks whether a document is present in Qdrant and previews its indexed chunks."""
+    chunks = await qdrant.get_document_chunks(document_id=document_id, limit=20)
+    if not chunks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document with ID '{document_id}' was not found in the indexed corpus.",
+        )
+
+    sample_chunks = [
+        {
+            "chunk_id": c.get("chunk_id"),
+            "chunk_index": c.get("chunk_index"),
+            "section": c.get("section"),
+            "page_number": c.get("page_number"),
+            "heading": c.get("heading"),
+            "token_count": c.get("token_count", 0),
+        }
+        for c in chunks
+    ]
+
+    filename = chunks[0].get("document_name") if chunks else None
+    return DocumentStatusResponse(
+        document_id=document_id,
+        filename=filename,
+        total_chunks=len(chunks),
+        status="indexed",
+        sample_chunks=sample_chunks,
+    )
+
+
+@router.delete(
+    "/documents/{document_id}",
+    response_model=DocumentDeleteResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Purge Document From Corpus",
+    description="Deletes all indexed vector chunks associated with a document_id from Qdrant Cloud.",
+)
+async def delete_document(
+    document_id: str,
+    qdrant: QdrantClientWrapper = Depends(get_qdrant_wrapper),
+    current_user: AuthenticatedUser = Depends(verify_clerk_token),
+) -> DocumentDeleteResponse:
+    """Purges all vector records belonging to the target document_id."""
+    # Check if document exists first
+    existing = await qdrant.get_document_chunks(document_id=document_id, limit=1)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Cannot delete document '{document_id}': Document does not exist in corpus.",
+        )
+
+    await qdrant.delete_document(document_id=document_id)
+    return DocumentDeleteResponse(
+        document_id=document_id,
+        deleted=True,
+        message=f"Document '{document_id}' and all associated vectors were successfully purged.",
+    )

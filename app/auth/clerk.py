@@ -1,10 +1,11 @@
 """Clerk authentication integration and route protection dependency."""
 
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any, Callable, Optional
 from fastapi import Depends, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import jwt
+from jwt import PyJWKClient, PyJWKClientError
 from pydantic import BaseModel
 
 from app.core.config import Settings, get_settings
@@ -15,6 +16,12 @@ logger = get_logger(__name__)
 
 # Security scheme for OpenAPI documentation
 bearer_security_scheme = HTTPBearer(auto_error=False)
+
+
+@lru_cache(maxsize=4)
+def get_jwks_client(jwks_url: str) -> PyJWKClient:
+    """Thread-safe, cached JWKS client for Clerk public key discovery."""
+    return PyJWKClient(jwks_url, cache_keys=True, max_cached_keys=16)
 
 
 class AuthenticatedUser(BaseModel):
@@ -32,11 +39,12 @@ async def verify_clerk_token(
     settings: Settings = Depends(get_settings),
 ) -> AuthenticatedUser:
     """
-    FastAPI dependency validating Clerk JWT session tokens.
+    FastAPI dependency cryptographically validating Clerk JWT session tokens.
     
-    Supports:
-    1. Dev mode bypass for local testing and hackathon judging when CLERK_DEV_MODE=True.
-    2. Verification via Clerk public PEM or JWKS in staging/production.
+    Security Standards:
+    1. Dev mode bypass ONLY allowed in non-production environments with synthetic test tokens.
+    2. In production, tokens MUST be cryptographically verified using Clerk PEM or Clerk JWKS.
+    3. Unsigned or unverified tokens are strictly rejected.
     """
     if credentials is None:
         raise AuthenticationError("Authorization header with Bearer token is missing")
@@ -45,18 +53,19 @@ async def verify_clerk_token(
     if not token:
         raise AuthenticationError("Bearer token string is empty")
 
-    # Developer / Hackathon test bypass hook
-    if settings.clerk_dev_mode and (token == "dev-test-token" or token.startswith("dev-user-")):
-        logger.debug("Clerk dev-mode active: accepting synthetic test token")
-        return AuthenticatedUser(
-            user_id="user_lexirag_hackathon_demo",
-            session_id="sess_demo_12345",
-            email="partner@azbpartners.example",
-            role="advocate",
-            raw_claims={"sub": "user_lexirag_hackathon_demo", "azp": "lexirag-portal"},
-        )
+    # Developer / Hackathon test bypass hook (strictly disabled in production)
+    if settings.environment != "production" and settings.clerk_dev_mode:
+        if token == "dev-test-token" or token.startswith("dev-user-"):
+            logger.debug("Clerk dev-mode active: accepting synthetic test token")
+            return AuthenticatedUser(
+                user_id="user_lexirag_hackathon_demo",
+                session_id="sess_demo_12345",
+                email="partner@azbpartners.example",
+                role="advocate",
+                raw_claims={"sub": "user_lexirag_hackathon_demo", "azp": "lexirag-portal"},
+            )
 
-    # Production JWT decoding
+    # Cryptographic JWT Signature Verification (Zero unverified fallback)
     try:
         if settings.clerk_pem_public_key:
             # Verified using pre-configured Clerk public PEM
@@ -65,15 +74,20 @@ async def verify_clerk_token(
                 key=settings.clerk_pem_public_key,
                 algorithms=["RS256"],
                 issuer=settings.clerk_issuer_url,
-                options={"verify_aud": False},
+                options={"verify_aud": False, "verify_signature": True},
             )
         else:
-            # Decode unverified header to fetch kid or verify without PEM if secret available
-            # If no PEM is configured and not in dev mode, we decode without signature verification
-            # only if explicitly permissible, or raise an error instructing configuration.
+            # Verified dynamically against Clerk JWKS endpoint
+            jwks_url = f"{settings.clerk_issuer_url.rstrip('/')}/.well-known/jwks.json"
+            jwks_client = get_jwks_client(jwks_url)
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            
             decoded_claims = jwt.decode(
                 token,
-                options={"verify_signature": False},
+                key=signing_key.key,
+                algorithms=["RS256"],
+                issuer=settings.clerk_issuer_url,
+                options={"verify_aud": False, "verify_signature": True},
             )
 
         user_id = decoded_claims.get("sub")
@@ -91,9 +105,11 @@ async def verify_clerk_token(
     except jwt.ExpiredSignatureError as exc:
         logger.warning("Clerk JWT expired: %s", exc)
         raise AuthenticationError("Clerk authentication token has expired") from exc
-    except jwt.InvalidTokenError as exc:
-        logger.warning("Invalid Clerk JWT structure or signature: %s", exc)
-        raise AuthenticationError("Invalid Clerk authentication token") from exc
+    except (jwt.InvalidTokenError, PyJWKClientError) as exc:
+        logger.warning("Invalid Clerk JWT structure, signature, or key discovery failure: %s", exc)
+        raise AuthenticationError("Invalid or unverified Clerk authentication token") from exc
+    except AuthenticationError:
+        raise
     except Exception as exc:
         logger.exception("Unexpected error during Clerk token verification")
         raise AuthenticationError(f"Authentication validation failed: {exc}") from exc
@@ -105,7 +121,6 @@ def require_clerk_auth(func: Callable) -> Callable:
     """
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        # Check if user context is already passed in kwargs
         if "user" not in kwargs or not isinstance(kwargs["user"], AuthenticatedUser):
             raise AuthenticationError("Operation requires verified Clerk authenticated user context")
         return await func(*args, **kwargs)

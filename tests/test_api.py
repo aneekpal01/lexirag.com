@@ -121,3 +121,42 @@ def test_qdrant_service_error_handling(test_client_and_mocks):
     assert response.status_code == 503
     data = response.json()
     assert data["error_code"] == "QDRANT_UNAVAILABLE"
+
+
+def test_request_id_generated_when_missing(test_client_and_mocks):
+    client, _, _ = test_client_and_mocks
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    request_id = response.headers.get("X-Request-ID")
+    assert request_id is not None
+    assert len(request_id) >= 16
+
+
+def test_incoming_request_id_preserved(test_client_and_mocks):
+    client, _, _ = test_client_and_mocks
+    custom_id = "req-lexirag-trace-998877"
+    response = client.get("/api/v1/health", headers={"X-Request-ID": custom_id})
+    assert response.status_code == 200
+    assert response.headers.get("X-Request-ID") == custom_id
+
+
+def test_cors_trusted_origin_accepted(test_client_and_mocks):
+    client, _, _ = test_client_and_mocks
+    headers = {
+        "Origin": "http://localhost:3000",
+        "Access-Control-Request-Method": "POST",
+    }
+    response = client.options("/api/v1/health", headers=headers)
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    assert response.headers.get("access-control-allow-credentials") == "true"
+
+
+def test_cors_untrusted_origin_rejected(test_client_and_mocks):
+    client, _, _ = test_client_and_mocks
+    headers = {
+        "Origin": "http://malicious-adversary.com",
+        "Access-Control-Request-Method": "POST",
+    }
+    response = client.options("/api/v1/health", headers=headers)
+    # Origin should not be allowed
+    assert response.headers.get("access-control-allow-origin") is None

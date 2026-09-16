@@ -35,3 +35,18 @@ def get_compiled_graph(
         qdrant_wrapper=qdrant_wrapper,
         settings=settings,
     )
+
+
+def get_ingestion_pipeline(
+    nebius_client: NebiusTokenFactoryClient = Depends(get_nebius_client),
+    qdrant_wrapper: QdrantClientWrapper = Depends(get_qdrant_wrapper),
+    settings: Settings = Depends(get_settings),
+):
+    """Provides a configured DocumentIngestionPipeline instance."""
+    from app.ingestion.pipeline import DocumentIngestionPipeline
+    return DocumentIngestionPipeline(
+        nebius_client=nebius_client,
+        qdrant_wrapper=qdrant_wrapper,
+        settings=settings,
+    )
+

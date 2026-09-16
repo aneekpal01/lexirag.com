@@ -47,3 +47,24 @@ class AuthenticationError(LexiRAGException):
 
 class InvalidLegalQueryError(LexiRAGException):
     """Raised when a query fails domain validation rules."""
+
+
+class InvalidDocumentError(LexiRAGException):
+    """Raised when an uploaded document is corrupted, invalid format, or unparseable."""
+
+
+class EmptyDocumentError(LexiRAGException):
+    """Raised when a document yields zero extractable characters (e.g. image-only PDF)."""
+
+
+class DocumentDuplicateError(LexiRAGException):
+    """Raised when a document with identical SHA-256 hash has already been ingested."""
+
+
+class DocumentNotFoundError(LexiRAGException):
+    """Raised when a document ID is not found in the indexed corpus."""
+
+
+class DocumentPayloadTooLargeError(LexiRAGException):
+    """Raised when uploaded content exceeds the maximum permitted byte size."""
+

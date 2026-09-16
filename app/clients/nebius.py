@@ -194,3 +194,59 @@ class NebiusTokenFactoryClient:
             raise NebiusServiceError("Nebius embedding endpoint returned empty vector payload")
 
         return response.data[0].embedding
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=INITIAL_BACKOFF_SECONDS, max=MAX_BACKOFF_SECONDS),
+        retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+    )
+    async def create_embeddings_batch(
+        self,
+        texts: list[str],
+        batch_size: Optional[int] = None,
+    ) -> list[list[float]]:
+        """
+        Generates dense vector embeddings for a list of texts in batches using BGE-M3 on Nebius.
+        
+        Applies batching to avoid token payload overages while reducing HTTP round-trip overhead.
+        """
+        if not texts:
+            return []
+
+        effective_batch_size = batch_size or self.settings.embedding_batch_size
+        cleaned_texts = [t.strip().replace("\n", " ") for t in texts]
+        all_embeddings: list[list[float]] = []
+
+        logger.debug(
+            "Generating batch embeddings | total_chunks: %d | batch_size: %d | model: %s",
+            len(cleaned_texts),
+            effective_batch_size,
+            self.settings.embedding_model,
+        )
+
+        for i in range(0, len(cleaned_texts), effective_batch_size):
+            chunk_batch = cleaned_texts[i : i + effective_batch_size]
+            batch_inputs = [text if text else "empty chunk" for text in chunk_batch]
+
+            try:
+                response = await self.client.embeddings.create(
+                    model=self.settings.embedding_model,
+                    input=batch_inputs,
+                )
+            except RateLimitError as exc:
+                raise NebiusRateLimitError(
+                    message=f"Rate limit exceeded on Nebius embedding model {self.settings.embedding_model}"
+                ) from exc
+            except APITimeoutError as exc:
+                raise NebiusTimeoutError("Nebius batch embedding generation timed out") from exc
+            except APIConnectionError as exc:
+                raise NebiusServiceError(f"Nebius embedding connection failed: {exc}") from exc
+            except Exception as exc:
+                raise NebiusServiceError(f"Nebius batch embedding failed: {exc}") from exc
+
+            batch_embeddings = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+            all_embeddings.extend(batch_embeddings)
+
+        return all_embeddings

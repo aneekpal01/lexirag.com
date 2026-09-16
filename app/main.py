@@ -10,6 +10,10 @@ from app.api.routes import router as legal_router
 from app.core.config import get_settings
 from app.core.exceptions import (
     AuthenticationError,
+    DocumentNotFoundError,
+    DocumentPayloadTooLargeError,
+    EmptyDocumentError,
+    InvalidDocumentError,
     InvalidLegalQueryError,
     NebiusExtractionError,
     NebiusRateLimitError,
@@ -18,6 +22,7 @@ from app.core.exceptions import (
     QdrantServiceError,
 )
 from app.core.logging import get_logger, setup_application_logging
+from app.core.middleware import RequestCorrelationMiddleware
 from app.schemas.errors import ErrorResponse
 
 logger = get_logger(__name__)
@@ -51,12 +56,16 @@ def create_application() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS configuration for SaaS frontend (e.g. Next.js dashboard)
+    # Request correlation tracing
+    app.add_middleware(RequestCorrelationMiddleware)
+
+    # Hardened CORS configuration for trusted web clients
+    settings = get_settings()
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
-        allow_methods=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -163,6 +172,58 @@ def create_application() -> FastAPI:
         )
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=payload.model_dump(),
+        )
+
+    @app.exception_handler(InvalidDocumentError)
+    async def handle_invalid_document_error(request: Request, exc: InvalidDocumentError) -> JSONResponse:
+        logger.warning("Invalid document upload rejected on %s: %s", request.url.path, exc.message)
+        payload = ErrorResponse(
+            error_code="INVALID_DOCUMENT",
+            message=exc.message,
+            details=exc.details,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=payload.model_dump(),
+        )
+
+    @app.exception_handler(EmptyDocumentError)
+    async def handle_empty_document_error(request: Request, exc: EmptyDocumentError) -> JSONResponse:
+        logger.warning("Empty document rejected on %s: %s", request.url.path, exc.message)
+        payload = ErrorResponse(
+            error_code="EMPTY_DOCUMENT",
+            message=exc.message,
+            details=exc.details,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=payload.model_dump(),
+        )
+
+    @app.exception_handler(DocumentPayloadTooLargeError)
+    async def handle_payload_too_large_error(request: Request, exc: DocumentPayloadTooLargeError) -> JSONResponse:
+        logger.warning("Payload too large rejected on %s: %s", request.url.path, exc.message)
+        payload = ErrorResponse(
+            error_code="DOCUMENT_PAYLOAD_TOO_LARGE",
+            message=exc.message,
+            details=exc.details,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content=payload.model_dump(),
+        )
+
+    @app.exception_handler(DocumentNotFoundError)
+    async def handle_document_not_found_error(request: Request, exc: DocumentNotFoundError) -> JSONResponse:
+        logger.warning("Document not found on %s: %s", request.url.path, exc.message)
+        payload = ErrorResponse(
+            error_code="DOCUMENT_NOT_FOUND",
+            message=exc.message,
+            details=exc.details,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
             content=payload.model_dump(),
         )
 

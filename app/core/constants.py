@@ -39,3 +39,12 @@ VALID_LEGAL_DOMAINS: Final[tuple[str, ...]] = (
     LEGAL_DOMAIN_CRIMINAL,
     LEGAL_DOMAIN_GENERAL,
 )
+
+# Document Ingestion & Chunking Constants
+MAX_DOCUMENT_UPLOAD_SIZE_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MB
+ALLOWED_DOCUMENT_EXTENSIONS: Final[tuple[str, ...]] = ("pdf", "docx", "txt")
+DEFAULT_CHUNK_SIZE_CHARS: Final[int] = 1000
+DEFAULT_CHUNK_OVERLAP_CHARS: Final[int] = 150
+DEFAULT_EMBEDDING_BATCH_SIZE: Final[int] = 16
+QDRANT_VECTOR_DIMENSION: Final[int] = 1024  # Matches BAAI/bge-m3 dense vector shape
+
