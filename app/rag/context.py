@@ -65,6 +65,7 @@ def deduplicate_evidence_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, 
     deduped_map: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     for chunk in chunks:
+        doc_id = chunk.get("document_id")
         act_or_doc = (
             chunk.get("act_name")
             or chunk.get("document_name")
@@ -77,7 +78,10 @@ def deduplicate_evidence_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, 
             or "General Provision"
         ).strip()
 
-        key = f"{act_or_doc.lower()}::{section.lower()}"
+        if doc_id and str(doc_id).strip():
+            key = f"{str(doc_id).strip().lower()}::{act_or_doc.lower()}::{section.lower()}"
+        else:
+            key = f"{act_or_doc.lower()}::{section.lower()}"
 
         if key not in deduped_map:
             # First instance: store a shallow copy
@@ -228,3 +232,218 @@ def build_grounded_context_block(
 
     compiled_context = "\n---\n".join(exhibit_blocks)
     return compiled_context, included_chunks
+
+
+def prune_chunks_per_document(
+    chunks: list[dict[str, Any]],
+    margin_ratio: float = DEFAULT_SCORE_MARGIN_RATIO,
+    min_score: float = 0.0,
+    max_per_doc: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """
+    Applies score margin pruning independently per document group.
+    
+    Prevents a high-scoring document from pruning away relevant provisions in another
+    requested document that has slightly lower cosine similarity scores.
+    """
+    if not chunks:
+        return []
+
+    # Group chunks by document_id or act_name
+    grouped: dict[str, list[dict[str, Any]]] = OrderedDict()
+    for chunk in chunks:
+        group_key = chunk.get("document_id") or chunk.get("act_name") or "default"
+        grouped.setdefault(group_key, []).append(chunk)
+
+    retained: list[dict[str, Any]] = []
+    for group_key, group_chunks in grouped.items():
+        pruned_group = prune_chunks_by_score_margin(
+            group_chunks,
+            margin_ratio=margin_ratio,
+            min_score=min_score,
+        )
+        if max_per_doc is not None and max_per_doc > 0:
+            pruned_group = pruned_group[:max_per_doc]
+        retained.extend(pruned_group)
+
+    logger.debug(
+        "Per-document score margin pruning | input: %d | retained: %d | groups: %d",
+        len(chunks),
+        len(retained),
+        len(grouped),
+    )
+    return retained
+
+
+def build_multi_document_research_context(
+    chunks: list[dict[str, Any]],
+    requested_document_ids: list[str],
+    max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+) -> tuple[str, list[dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
+    """
+    Assembles evidence into document-partitioned exhibition blocks for multi-document comparison.
+    
+    Returns:
+        (compiled_context_string, included_chunks, document_evidence_groups, missing_documents)
+    """
+    if not chunks:
+        missing_docs = list(requested_document_ids)
+        refusal_text = (
+            "NO VERIFIED STATUTORY OR DOCUMENT EVIDENCE FOUND IN THE INDEXED CORPUS FOR THE REQUESTED DOCUMENTS.\n"
+            f"Requested Document IDs: {', '.join(missing_docs)}\n"
+            "The system retrieved zero matching provisions above the required similarity threshold."
+        )
+        return refusal_text, [], {}, missing_docs
+
+    deduped = deduplicate_evidence_chunks(chunks)
+
+    # Group deduped chunks by document_id
+    chunks_by_doc: dict[str, list[dict[str, Any]]] = OrderedDict()
+    for doc_id in requested_document_ids:
+        chunks_by_doc[doc_id] = []
+
+    for chunk in deduped:
+        c_doc_id = chunk.get("document_id")
+        if c_doc_id and c_doc_id in chunks_by_doc:
+            chunks_by_doc[c_doc_id].append(chunk)
+        elif c_doc_id:
+            chunks_by_doc.setdefault(c_doc_id, []).append(chunk)
+        else:
+            chunks_by_doc.setdefault("unspecified_statutes", []).append(chunk)
+
+    missing_documents: list[str] = [
+        doc_id for doc_id in requested_document_ids if not chunks_by_doc.get(doc_id)
+    ]
+
+    doc_groups: dict[str, dict[str, Any]] = {}
+    included_chunks: list[dict[str, Any]] = []
+    doc_blocks: list[str] = []
+    exhibit_index = 1
+    current_char_count = 0
+
+    active_doc_keys = [k for k, v in chunks_by_doc.items() if v]
+
+    for doc_idx, doc_key in enumerate(active_doc_keys, start=1):
+        doc_chunks = chunks_by_doc[doc_key]
+        # Order: primary evidence first, then supporting
+        primaries = [c for c in doc_chunks if c.get("evidence_role") == "primary" or not c.get("evidence_role")]
+        supportings = [c for c in doc_chunks if c.get("evidence_role") and c.get("evidence_role") != "primary"]
+        candidates = primaries + supportings
+
+        first_chunk = candidates[0] if candidates else {}
+        doc_name = (
+            first_chunk.get("document_name")
+            or first_chunk.get("act_name")
+            or doc_key
+        )
+
+        doc_header = (
+            f"================================================================================\n"
+            f"DOCUMENT [{doc_idx}/{len(active_doc_keys)}]: {doc_name} (ID: {doc_key})\n"
+            f"================================================================================"
+        )
+        current_char_count += len(doc_header) + 2
+
+        doc_exhibit_blocks: list[str] = []
+        doc_exhibit_ids: list[str] = []
+        doc_provisions: list[str] = []
+        doc_primary_count = 0
+        doc_supporting_count = 0
+
+        for chunk in candidates:
+            source_name = (
+                chunk.get("document_name")
+                or chunk.get("act_name")
+                or doc_name
+            ).strip()
+            section_label = chunk.get("section") or chunk.get("heading") or "General Provision"
+            role_val = chunk.get("evidence_role", "primary")
+
+            if role_val == "primary" or not role_val:
+                doc_primary_count += 1
+                role_desc = "Primary Evidence"
+                raw_score = chunk.get("similarity_score")
+                score_desc = f"{float(raw_score):.4f}" if raw_score is not None else "Direct Match"
+            else:
+                doc_supporting_count += 1
+                role_desc = "Supporting Context"
+                score_desc = "Structural Context (No Vector Score)"
+
+            exhibit_header_lines = [
+                f"[EXHIBIT {exhibit_index}] Document: {source_name} (ID: {doc_key}) | Provision: {section_label}",
+                f"Role: {role_desc} | Match Score: {score_desc}",
+            ]
+            if chunk.get("page_number"):
+                exhibit_header_lines[1] += f" | Page: {chunk['page_number']}"
+            if chunk.get("expansion_reason"):
+                exhibit_header_lines.append(f"Expansion Note: {chunk['expansion_reason']}")
+
+            content = chunk.get("content", "").strip()
+            block = f"{chr(10).join(exhibit_header_lines)}\nVERBATIM PROVISION:\n{content}\n"
+            block_len = len(block)
+
+            if current_char_count + block_len > max_chars and included_chunks:
+                logger.warning(
+                    "Context character budget reached in multi-doc assembly (%d / %d chars). Truncating.",
+                    current_char_count,
+                    max_chars,
+                )
+                break
+
+            chunk_entry = dict(chunk)
+            chunk_entry["exhibit_id"] = f"EXHIBIT_{exhibit_index}"
+            chunk_entry["exhibit_label"] = f"[EXHIBIT {exhibit_index}]"
+            chunk_entry["exhibit_num"] = exhibit_index
+            chunk_entry["document_id"] = doc_key
+            chunk_entry["document_name"] = doc_name
+
+            doc_exhibit_blocks.append(block)
+            doc_exhibit_ids.append(f"EXHIBIT_{exhibit_index}")
+            if section_label not in doc_provisions:
+                doc_provisions.append(section_label)
+
+            included_chunks.append(chunk_entry)
+            current_char_count += block_len
+            exhibit_index += 1
+
+        if doc_exhibit_blocks:
+            doc_section_str = "\n---\n".join(doc_exhibit_blocks)
+            doc_blocks.append(f"{doc_header}\n{doc_section_str}")
+
+        doc_groups[doc_key] = {
+            "document_id": doc_key,
+            "document_name": doc_name,
+            "primary_chunk_count": doc_primary_count,
+            "supporting_chunk_count": doc_supporting_count,
+            "chunk_count": len(doc_exhibit_ids),
+            "exhibit_ids": doc_exhibit_ids,
+            "provisions_covered": doc_provisions,
+            "has_sufficient_evidence": len(doc_exhibit_ids) > 0,
+        }
+
+    # Record entries for missing documents
+    for m_doc in missing_documents:
+        doc_groups[m_doc] = {
+            "document_id": m_doc,
+            "document_name": f"Requested Document ({m_doc[:8]}...)",
+            "primary_chunk_count": 0,
+            "supporting_chunk_count": 0,
+            "chunk_count": 0,
+            "exhibit_ids": [],
+            "provisions_covered": [],
+            "has_sufficient_evidence": False,
+        }
+
+    compiled_context = "\n\n".join(doc_blocks)
+
+    if missing_documents:
+        limitation_notice = (
+            "\n\n================================================================================\n"
+            "[EVIDENTIARY LIMITATION - MISSING DOCUMENT EVIDENCE]\n"
+            f"The indexed corpus did not establish matching provisions for: {', '.join(missing_documents)}.\n"
+            "MANDATORY: Do NOT fabricate or assume provisions for missing documents. Explicitly declare this gap.\n"
+            "================================================================================"
+        )
+        compiled_context += limitation_notice
+
+    return compiled_context, included_chunks, doc_groups, missing_documents

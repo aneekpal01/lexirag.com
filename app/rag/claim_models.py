@@ -63,6 +63,11 @@ class LegalClaim(BaseModel):
         default=False,
         description="True if differing provisions suggest a potential legal conflict requiring judicial reconciliation.",
     )
+
+    @property
+    def evidentiary_gaps(self) -> list[str]:
+        return self.unsupported_aspects
+
     is_atomic: bool = Field(
         default=True,
         description="Indicates whether the proposition was decomposed safely or kept intact.",

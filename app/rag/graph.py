@@ -9,7 +9,9 @@ from app.clients.qdrant import QdrantClientWrapper
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.rag.nodes import (
+    build_research_context_node,
     classify_query_node,
+    detect_cross_document_relations_node,
     expand_evidence_graph_node,
     format_citations_node,
     generate_answer_node,
@@ -27,7 +29,7 @@ def build_legal_rag_graph(
     settings: Settings,
 ) -> CompiledStateGraph:
     """
-    Constructs and compiles the 6-stage LangGraph workflow with dependency-injected clients.
+    Constructs and compiles the 8-stage LangGraph workflow with dependency-injected clients.
     
     Pipeline Topology:
     [START] 
@@ -42,13 +44,19 @@ def build_legal_rag_graph(
     [expand_evidence_graph] (Controlled Structural Expansion)
        │
        ▼
+    [build_research_context] (Document Evidence Grouping & Framing)
+       │
+       ▼
     [generate_answer] (Routes to Nemotron-3-Nano or Super-120b)
        │
        ▼
     [verify_citations] (Two-Tier Empirical Evidence Verification)
        │
        ▼
-    [format_citations] (Indian statutory & precedent formatting)
+    [detect_cross_document_relations] (Cross-Document Provision Alignment & Relations)
+       │
+       ▼
+    [format_citations] (Indian statutory & precedent formatting + comparison analysis)
        │
        ▼
      [END]
@@ -65,11 +73,17 @@ def build_legal_rag_graph(
     async def bound_expand_node(state: LegalGraphState) -> dict[str, Any]:
         return await expand_evidence_graph_node(state, qdrant_wrapper, settings)
 
+    async def bound_build_research_context_node(state: LegalGraphState) -> dict[str, Any]:
+        return await build_research_context_node(state, settings)
+
     async def bound_generate_node(state: LegalGraphState) -> dict[str, Any]:
-        return await generate_answer_node(state, nebius_client)
+        return await generate_answer_node(state, nebius_client, settings)
 
     async def bound_verify_node(state: LegalGraphState) -> dict[str, Any]:
         return await verify_citations_node(state, settings, nebius_client)
+
+    async def bound_detect_relations_node(state: LegalGraphState) -> dict[str, Any]:
+        return await detect_cross_document_relations_node(state, settings)
 
     async def bound_format_citations_node(state: LegalGraphState) -> dict[str, Any]:
         return await format_citations_node(state)
@@ -78,17 +92,21 @@ def build_legal_rag_graph(
     graph_builder.add_node("classify_query", bound_classify_node)
     graph_builder.add_node("retrieve_context", bound_retrieve_node)
     graph_builder.add_node("expand_evidence_graph", bound_expand_node)
+    graph_builder.add_node("build_research_context", bound_build_research_context_node)
     graph_builder.add_node("generate_answer", bound_generate_node)
     graph_builder.add_node("verify_citations", bound_verify_node)
+    graph_builder.add_node("detect_cross_document_relations", bound_detect_relations_node)
     graph_builder.add_node("format_citations", bound_format_citations_node)
 
     # Define linear graph edges
     graph_builder.add_edge(START, "classify_query")
     graph_builder.add_edge("classify_query", "retrieve_context")
     graph_builder.add_edge("retrieve_context", "expand_evidence_graph")
-    graph_builder.add_edge("expand_evidence_graph", "generate_answer")
+    graph_builder.add_edge("expand_evidence_graph", "build_research_context")
+    graph_builder.add_edge("build_research_context", "generate_answer")
     graph_builder.add_edge("generate_answer", "verify_citations")
-    graph_builder.add_edge("verify_citations", "format_citations")
+    graph_builder.add_edge("verify_citations", "detect_cross_document_relations")
+    graph_builder.add_edge("detect_cross_document_relations", "format_citations")
     graph_builder.add_edge("format_citations", END)
 
     compiled_graph = graph_builder.compile()

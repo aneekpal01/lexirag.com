@@ -14,8 +14,10 @@ class LegalGraphState(TypedDict, total=False):
     query: str
     domain: Optional[str]
     document_id: Optional[str]
+    document_ids: Optional[list[str]]
     jurisdiction: str
     force_complex: bool
+    is_comparison_query: bool
 
     # Classification & routing results
     query_complexity: QueryComplexity
@@ -49,6 +51,14 @@ class LegalGraphState(TypedDict, total=False):
     verified_claims: list[dict[str, Any]]
     unsupported_claims: list[dict[str, Any]]
     verification_summary: Optional[dict[str, Any]]
+
+    # Phase 5 Multi-Document Research & Comparison Artifacts
+    document_evidence_groups: Optional[dict[str, Any]]
+    comparison_relations: Optional[list[dict[str, Any]]]
+    comparison_matrix: Optional[dict[str, Any]]
+    cross_document_claims: Optional[list[dict[str, Any]]]
+    missing_documents: Optional[list[str]]
+    comparison_analysis: Optional[dict[str, Any]]
 
     # Citation formatting outputs
     citations: list[dict[str, Any]]

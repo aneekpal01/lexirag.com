@@ -203,6 +203,21 @@ class LegalEvidenceVerifier:
             final_status = overlap_status
             rationale = overlap_note
 
+        # Step 5b: Bipartite Multi-Document Attribution Check (Mandatory Requirement #3)
+        if self._is_cross_document_comparison(claim):
+            distinct_docs = {
+                ex.get("document_id") for ex in target_exhibits if ex.get("document_id")
+            }
+            if len(distinct_docs) < 2:
+                final_status = SupportStatus.PARTIALLY_SUPPORTED
+                rationale = (
+                    f"{rationale} [Bipartite Evidence Gap - Bipartite attribution incomplete]: Claim asserts a comparison across documents, "
+                    "but supporting exhibits in context originate from only one document."
+                ).strip()
+                gap_note = "Missing supporting evidence for comparison counterpart document (distinct documents required)"
+                if gap_note not in claim.unsupported_aspects:
+                    claim.unsupported_aspects.append(gap_note)
+
         # Step 6: Check for Potential Conflicting Evidence Across Exhibits
         has_conflict, conflict_note = self._check_inter_exhibit_conflicts(target_exhibits)
         if has_conflict:
@@ -222,6 +237,27 @@ class LegalEvidenceVerifier:
             claim = await self._run_selective_llm_verification(claim, target_exhibits)
 
         return claim
+
+    def _is_cross_document_comparison(self, claim: LegalClaim) -> bool:
+        """Determines if a claim asserts a comparative relation across multiple documents."""
+        lowered = claim.claim_text.lower()
+        comparative_markers = (
+            "whereas", "while", "unlike", "in contrast", "compared to",
+            "longer than", "shorter than", "higher than", "lower than",
+            "differs from", "different from", "difference between",
+            "both contracts", "both agreements", "both documents",
+            "neither contract", "contract a", "contract b",
+        )
+        if any(m in lowered for m in comparative_markers):
+            return True
+        # Check if multiple distinct document names appear in the claim text
+        doc_names = {
+            str(ex.get("document_name", "")).lower()
+            for ex in self.included_chunks
+            if ex.get("document_name")
+        }
+        matched_docs = [d for d in doc_names if d and len(d) > 3 and d in lowered]
+        return len(matched_docs) >= 2
 
     def _resolve_target_exhibits(self, claim: LegalClaim) -> list[dict[str, Any]]:
         """Resolves target exhibits from explicit citation or conservative fallback attribution."""
@@ -273,7 +309,7 @@ class LegalEvidenceVerifier:
             return SupportStatus.SUPPORTED, "No explicit statutory section numbers to validate"
 
         exhibits_text = " ".join(
-            f"{ex.get('section', '')} {ex.get('heading', '')} {ex.get('content', '')}"
+            f"{ex.get('act_name', '')} {ex.get('document_name', '')} {ex.get('section', '')} {ex.get('heading', '')} {ex.get('content', '')}"
             for ex in exhibits
         ).lower()
 
@@ -305,7 +341,7 @@ class LegalEvidenceVerifier:
             return SupportStatus.SUPPORTED, "No explicit numeric anchors asserted", []
 
         exhibits_text = " ".join(
-            f"{ex.get('section', '')} {ex.get('heading', '')} {ex.get('content', '')}"
+            f"{ex.get('act_name', '')} {ex.get('document_name', '')} {ex.get('section', '')} {ex.get('heading', '')} {ex.get('content', '')}"
             for ex in exhibits
         ).lower()
 
@@ -364,6 +400,7 @@ class LegalEvidenceVerifier:
         stop_words = {
             "this", "that", "with", "from", "under", "which", "shall", "every", "company",
             "section", "exhibit", "having", "their", "there", "other", "where", "about",
+            "whereas", "while", "specifies", "requires", "states", "between", "these",
         }
         substantive_claim_tokens = claim_tokens - stop_words
 
@@ -371,7 +408,7 @@ class LegalEvidenceVerifier:
             return SupportStatus.SUPPORTED, "Substantive claim validated against exhibit provision"
 
         exhibits_content = " ".join(
-            f"{ex.get('section', '')} {ex.get('heading', '')} {ex.get('content', '')}"
+            f"{ex.get('act_name', '')} {ex.get('document_name', '')} {ex.get('section', '')} {ex.get('heading', '')} {ex.get('content', '')}"
             for ex in exhibits
         ).lower()
         exhibit_tokens = set(re.findall(r"\b[a-zA-Z]{4,}\b", exhibits_content))

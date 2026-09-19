@@ -22,6 +22,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import get_logger
 from app.ingestion.pipeline import DocumentIngestionPipeline
+from app.rag.comparison_models import ComparisonAnalysisSummary
 from app.rag.state import LegalGraphState
 from app.schemas.ingestion import (
     DocumentDeleteResponse,
@@ -67,8 +68,10 @@ async def query_legal_corpus(
         "query": request.query,
         "domain": request.domain,
         "document_id": request.document_id,
+        "document_ids": request.document_ids,
         "jurisdiction": request.jurisdiction,
         "force_complex": request.force_complex_reasoning,
+        "is_comparison_query": bool(request.document_ids and len(request.document_ids) > 1),
     }
 
     # Execute the compiled LangGraph workflow
@@ -86,6 +89,12 @@ async def query_legal_corpus(
         ClaimVerificationSummary(**verification_dict) if verification_dict else None
     )
 
+    # Parse comparison analysis summary if present
+    comp_dict = final_state.get("comparison_analysis")
+    structured_comparison = (
+        ComparisonAnalysisSummary(**comp_dict) if comp_dict else None
+    )
+
     response_payload = LegalQueryResponse(
         answer=final_state.get("final_answer", ""),
         citations=structured_citations,
@@ -99,6 +108,7 @@ async def query_legal_corpus(
         expansion_applied=final_state.get("expansion_applied", False),
         expansion_count=final_state.get("expansion_count", 0),
         verification=structured_verification,
+        comparison_analysis=structured_comparison,
     )
 
     logger.info(

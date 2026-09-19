@@ -19,7 +19,14 @@ from app.core.constants import (
 from app.core.logging import get_logger
 from app.rag.claim_extractor import DeterministicClaimExtractor
 from app.rag.claim_models import ClaimVerificationSummary, SupportStatus
-from app.rag.context import build_grounded_context_block, prune_chunks_by_score_margin
+from app.rag.comparison_models import ComparisonAnalysisSummary, ComparisonRelation
+from app.rag.context import (
+    build_grounded_context_block,
+    build_multi_document_research_context,
+    prune_chunks_by_score_margin,
+    prune_chunks_per_document,
+)
+from app.rag.cross_document import CrossDocumentRelationDetector
 from app.rag.expansion import ControlledEvidenceExpander
 from app.rag.state import LegalGraphState
 from app.rag.verifier import LegalEvidenceVerifier
@@ -90,7 +97,14 @@ async def classify_query_node(
             return settings.top_k_complex, settings.min_score_complex
         return settings.top_k_simple, settings.min_score_simple
 
-    # 2. Manual force-override if client explicitly demands high-capacity reasoning
+    # 2. Check for multi-document comparison intent
+    doc_ids = state.get("document_ids") or []
+    lowered_query = query_text.lower()
+    is_comparison_query = len(doc_ids) > 1 or any(
+        cmp_word in lowered_query for cmp_word in ("compare", "difference between", "versus", "vs ")
+    )
+
+    # 3. Manual force-override if client explicitly demands high-capacity reasoning
     if force_complex:
         logger.info("Forced complex reasoning requested by client caller")
         top_k, min_score = _get_adaptive_bounds(True)
@@ -102,10 +116,25 @@ async def classify_query_node(
             "domain_inferred": domain_inferred,
             "retrieval_top_k": top_k,
             "retrieval_min_score": min_score,
+            "is_comparison_query": is_comparison_query,
         }
 
-    # 3. Fast heuristic check for overt multi-statute indicators
-    lowered_query = query_text.lower()
+    # 4. Multi-document comparison queries route to complex tier for multi-hop synthesis
+    if is_comparison_query:
+        logger.info("Multi-document comparison detected; routing to Super-120b")
+        top_k, min_score = _get_adaptive_bounds(True)
+        return {
+            "query_complexity": "complex",
+            "selected_model": settings.nemotron_super_model,
+            "classification_reasoning": "Query entails multi-document research and comparative provision synthesis.",
+            "detected_domain": detected_domain or LEGAL_DOMAIN_GENERAL,
+            "domain_inferred": domain_inferred,
+            "retrieval_top_k": top_k,
+            "retrieval_min_score": min_score,
+            "is_comparison_query": True,
+        }
+
+    # 5. Fast heuristic check for overt multi-statute indicators
     matches = [indicator for indicator in COMPLEX_LEGAL_INDICATORS if indicator in lowered_query]
     if len(matches) >= 2:
         logger.info("Heuristic complexity trigger matched indicators: %s", matches)
@@ -118,9 +147,10 @@ async def classify_query_node(
             "domain_inferred": domain_inferred,
             "retrieval_top_k": top_k,
             "retrieval_min_score": min_score,
+            "is_comparison_query": False,
         }
 
-    # 4. LLM Classification & Domain Inference via Nemotron Nano
+    # 6. LLM Classification & Domain Inference via Nemotron Nano
     classification_prompt = [
         {
             "role": "system",
@@ -182,6 +212,7 @@ async def classify_query_node(
             "domain_inferred": domain_inferred,
             "retrieval_top_k": top_k,
             "retrieval_min_score": min_score,
+            "is_comparison_query": is_comparison_query,
         }
 
     except Exception as exc:
@@ -198,6 +229,7 @@ async def classify_query_node(
             "domain_inferred": domain_inferred,
             "retrieval_top_k": top_k,
             "retrieval_min_score": min_score,
+            "is_comparison_query": is_comparison_query,
         }
 
 
@@ -216,6 +248,7 @@ async def retrieve_context_node(
     query_text = state["query"]
     domain_to_filter = state.get("detected_domain") or state.get("domain")
     document_id_filter = state.get("document_id")
+    document_ids = state.get("document_ids")
     domain_inferred = state.get("domain_inferred", False)
 
     top_k = state.get("retrieval_top_k", settings.top_k_retrieval_limit)
@@ -225,54 +258,107 @@ async def retrieve_context_node(
     query_vector = await nebius_client.create_embedding(text=query_text)
 
     # Step 2: Vector similarity search against pre-embedded corpus in Qdrant Cloud
-    retrieved_statutes = await qdrant_wrapper.search_statutes(
-        query_vector=query_vector,
-        top_k=top_k,
-        min_score=min_score,
-        domain_filter=domain_to_filter,
-        document_id_filter=document_id_filter,
-    )
-
     filter_relaxed = False
+    missing_documents: list[str] = []
 
-    # Step 3: Enforce strict Filter Relaxation Safety Rules (Mandatory Correction #1)
-    if not retrieved_statutes:
-        # If user explicitly provided document_id: NEVER relax!
-        if document_id_filter and document_id_filter.strip():
-            logger.info(
-                "Zero chunks retrieved for explicit document_id '%s'. Preserving strict document boundary; not relaxing.",
-                document_id_filter,
-            )
-        # If domain was automatically inferred (and no doc_id was passed), execute controlled relaxation
-        elif domain_inferred and domain_to_filter:
-            logger.info(
-                "Zero chunks retrieved with auto-inferred domain filter '%s'. Executing controlled filter relaxation.",
-                domain_to_filter,
-            )
-            relaxed_statutes = await qdrant_wrapper.search_statutes(
-                query_vector=query_vector,
-                top_k=top_k,
-                min_score=min_score,
-                domain_filter=None,
-                document_id_filter=None,
-            )
-            if relaxed_statutes:
-                retrieved_statutes = relaxed_statutes
-                filter_relaxed = True
-                logger.info("Filter relaxation succeeded: recovered %d statutory chunks", len(retrieved_statutes))
+    if document_ids and len(document_ids) > 1:
+        # Multi-document path: execute balanced per-document retrieval to prevent starvation
+        logger.info(
+            "Executing balanced multi-document retrieval across %d documents: %s",
+            len(document_ids),
+            document_ids,
+        )
+        top_k_per_doc = max(2, settings.top_k_per_document)
+        balanced_dict = await qdrant_wrapper.search_documents_balanced(
+            query_vector=query_vector,
+            document_ids=document_ids,
+            top_k_per_doc=top_k_per_doc,
+            min_score=min_score,
+            domain_filter=domain_to_filter,
+        )
+        retrieved_statutes: list[Any] = []
+        missing_documents: list[str] = []
+
+        if isinstance(balanced_dict, dict):
+            for d_id in document_ids:
+                d_chunks = balanced_dict.get(d_id, [])
+                if not d_chunks:
+                    missing_documents.append(d_id)
+                else:
+                    retrieved_statutes.extend(d_chunks)
+        elif isinstance(balanced_dict, list):
+            retrieved_statutes = list(balanced_dict)
+            found_ids = {
+                (c.document_id if hasattr(c, "document_id") else c.get("document_id"))
+                for c in retrieved_statutes
+            }
+            missing_documents = [d for d in document_ids if d not in found_ids]
+
+        # Enforce strict document boundary: ensure only requested document_ids survive
+        retrieved_statutes = [
+            c for c in retrieved_statutes
+            if (c.document_id if hasattr(c, "document_id") else c.get("document_id")) in document_ids
+        ]
+
+        serialized_chunks = [
+            (chunk.model_dump() if hasattr(chunk, "model_dump") else chunk)
+            for chunk in retrieved_statutes
+        ]
+
+        # Apply per-document score margin pruning to guarantee representation
+        filtered_chunks = prune_chunks_per_document(
+            serialized_chunks,
+            margin_ratio=settings.score_margin_ratio,
+            min_score=min_score,
+        )
+    else:
+        # Standard single-document or unconstrained statutory retrieval
+        retrieved_statutes = await qdrant_wrapper.search_statutes(
+            query_vector=query_vector,
+            top_k=top_k,
+            min_score=min_score,
+            domain_filter=domain_to_filter,
+            document_id_filter=document_id_filter,
+        )
+
+        # Step 3: Enforce strict Filter Relaxation Safety Rules (Mandatory Correction #1)
+        if not retrieved_statutes:
+            # If user explicitly provided document_id: NEVER relax!
+            if document_id_filter and document_id_filter.strip():
+                logger.info(
+                    "Zero chunks retrieved for explicit document_id '%s'. Preserving strict document boundary; not relaxing.",
+                    document_id_filter,
+                )
+            # If domain was automatically inferred (and no doc_id was passed), execute controlled relaxation
+            elif domain_inferred and domain_to_filter:
+                logger.info(
+                    "Zero chunks retrieved with auto-inferred domain filter '%s'. Executing controlled filter relaxation.",
+                    domain_to_filter,
+                )
+                relaxed_statutes = await qdrant_wrapper.search_statutes(
+                    query_vector=query_vector,
+                    top_k=top_k,
+                    min_score=min_score,
+                    domain_filter=None,
+                    document_id_filter=None,
+                )
+                if relaxed_statutes:
+                    retrieved_statutes = relaxed_statutes
+                    filter_relaxed = True
+                    logger.info("Filter relaxation succeeded: recovered %d statutory chunks", len(retrieved_statutes))
+                else:
+                    filter_relaxed = True
             else:
-                filter_relaxed = True
-        else:
-            logger.info("Zero chunks retrieved for explicit domain filter '%s'; preserving client filter.", domain_to_filter)
+                logger.info("Zero chunks retrieved for explicit domain filter '%s'; preserving client filter.", domain_to_filter)
 
-    serialized_chunks = [chunk.model_dump() for chunk in retrieved_statutes]
+        serialized_chunks = [chunk.model_dump() for chunk in retrieved_statutes]
 
-    # Step 4: Relative Score Margin Pruning
-    filtered_chunks = prune_chunks_by_score_margin(
-        serialized_chunks,
-        margin_ratio=settings.score_margin_ratio,
-        min_score=min_score,
-    )
+        # Step 4: Relative Score Margin Pruning
+        filtered_chunks = prune_chunks_by_score_margin(
+            serialized_chunks,
+            margin_ratio=settings.score_margin_ratio,
+            min_score=min_score,
+        )
 
     fallback_triggered = len(filtered_chunks) == 0
 
@@ -289,6 +375,7 @@ async def retrieve_context_node(
         "filtered_chunks": filtered_chunks,
         "fallback_triggered": fallback_triggered,
         "filter_relaxed": filter_relaxed,
+        "missing_documents": missing_documents,
     }
 
 
@@ -318,10 +405,14 @@ async def expand_evidence_graph_node(
             "expansion_count": 0,
         }
 
+    explicit_document_id = state.get("document_id")
+    explicit_document_ids = state.get("document_ids")
+
     expander = ControlledEvidenceExpander(qdrant_wrapper=qdrant_wrapper, settings=settings)
     graph = await expander.expand_evidence(
         primary_chunks=filtered_chunks,
         explicit_document_id=explicit_document_id,
+        explicit_document_ids=explicit_document_ids,
     )
 
     supporting_nodes = graph.get_supporting_nodes()
@@ -347,6 +438,49 @@ async def expand_evidence_graph_node(
     }
 
 
+async def build_research_context_node(
+    state: LegalGraphState,
+    settings: Optional[Settings] = None,
+) -> dict[str, Any]:
+    """
+    Partitions evidence into DocumentEvidenceGroups and compiles grounded context blocks.
+    
+    If is_comparison_query is True and multiple document_ids are present:
+    - Organizes evidence chunks into document-partitioned exhibition blocks.
+    - Flags missing requested documents without hallucinating evidence.
+    - Populates document_evidence_groups and missing_documents in state.
+    Otherwise:
+    - Assembles standard linear exhibition blocks.
+    """
+    candidate_chunks = state.get("filtered_chunks", [])
+    current_settings = settings or get_settings()
+    document_ids = state.get("document_ids") or []
+    is_comparison = state.get("is_comparison_query", False) or len(document_ids) > 1
+
+    if is_comparison and len(document_ids) > 1:
+        compiled_context, included_chunks, doc_groups, missing_docs = build_multi_document_research_context(
+            chunks=candidate_chunks,
+            requested_document_ids=document_ids,
+            max_chars=current_settings.max_context_chars,
+        )
+        group_list = list(doc_groups.values()) if isinstance(doc_groups, dict) else doc_groups
+        return {
+            "context_text": compiled_context,
+            "filtered_chunks": included_chunks,
+            "document_evidence_groups": group_list,
+            "missing_documents": missing_docs,
+        }
+    else:
+        compiled_context, included_chunks = build_grounded_context_block(
+            candidate_chunks,
+            max_chars=current_settings.max_context_chars,
+        )
+        return {
+            "context_text": compiled_context,
+            "filtered_chunks": included_chunks,
+        }
+
+
 async def generate_answer_node(
     state: LegalGraphState,
     nebius_client: NebiusTokenFactoryClient,
@@ -362,18 +496,21 @@ async def generate_answer_node(
     selected_model = state["selected_model"]
     current_settings = settings or get_settings()
 
-    # Prefer filtered_chunks (pruned/deduplicated), fallback to retrieved_chunks for backward compatibility
-    candidate_chunks = state.get("filtered_chunks")
-    if candidate_chunks is None:
-        candidate_chunks = state.get("retrieved_chunks", [])
+    # If context_text was already compiled by build_research_context_node, reuse it
+    compiled_context = state.get("context_text")
+    included_chunks = state.get("filtered_chunks")
+
+    if compiled_context is None or included_chunks is None:
+        candidate_chunks = state.get("filtered_chunks")
+        if candidate_chunks is None:
+            candidate_chunks = state.get("retrieved_chunks", [])
+
+        compiled_context, included_chunks = build_grounded_context_block(
+            candidate_chunks,
+            max_chars=current_settings.max_context_chars,
+        )
 
     fallback_triggered = state.get("fallback_triggered", False)
-
-    # Compile statutory exhibition context block with character budgeting
-    compiled_context, included_chunks = build_grounded_context_block(
-        candidate_chunks,
-        max_chars=current_settings.max_context_chars,
-    )
 
     system_instruction = (
         "You are LexiRAG, an authoritative Indian senior legal research counsel specializing in Indian "
@@ -394,6 +531,18 @@ async def generate_answer_node(
         "6. INLINE CITATIONS: For each substantive legal proposition derived from an exhibit, append the specific exhibit "
         "reference tag directly inline (e.g., [EXHIBIT 1])."
     )
+
+    if state.get("is_comparison_query"):
+        system_instruction += (
+            "\n\nMULTI-DOCUMENT COMPARISON DIRECTIVES:\n"
+            "7. SYSTEMATIC PROVISION COMPARISON: Methodically compare the requested documents provision by provision.\n"
+            "8. BIPARTITE INLINE CITATIONS: When asserting any difference, similarity, or comparison between documents, "
+            "cite the relevant exhibits from BOTH documents (e.g. [EXHIBIT 1] and [EXHIBIT 2]).\n"
+            "9. NO SPECULATION ON MISSING PROVISIONS: If a document has no evidence for a provision, explicitly report "
+            "that the provision was not found in that document's indexed corpus evidence. Do NOT assume absence implies agreement.\n"
+            "10. CAUTIOUS TERMINOLOGY: Describe differences as 'apparent differences' or 'potential conflicts'. "
+            "Never assert that one document breaches another unless explicitly evidenced."
+        )
 
     if fallback_triggered or not included_chunks:
         user_message_content = (
@@ -421,6 +570,15 @@ async def generate_answer_node(
         temperature=0.1 if (fallback_triggered or not included_chunks) else 0.2,
         max_tokens=3500,
     )
+
+    missing_docs = state.get("missing_documents", [])
+    if missing_docs:
+        limitation_header = (
+            f"\n\n**EVIDENTIARY LIMITATION — MISSING DOCUMENT EVIDENCE:**\n"
+            f"No matching legal provisions were retrieved from the indexed corpus for the following requested "
+            f"document(s): {', '.join(missing_docs)}. Comparison analysis is limited strictly to available evidence."
+        )
+        synthesized_answer += limitation_header
 
     return {
         "raw_answer": synthesized_answer,
@@ -526,6 +684,46 @@ async def verify_citations_node(
     }
 
 
+async def detect_cross_document_relations_node(
+    state: LegalGraphState,
+    settings: Optional[Settings] = None,
+) -> dict[str, Any]:
+    """
+    Detects cross-document relational semantics across compared documents.
+    
+    Runs strictly after citation verification to ensure that relations are derived
+    only from verified claims and grounded exhibits.
+    """
+    current_settings = settings or get_settings()
+    is_comparison = state.get("is_comparison_query", False)
+    document_ids = state.get("document_ids") or []
+
+    if not is_comparison or len(document_ids) < 2 or not current_settings.enable_cross_document_relations:
+        return {
+            "comparison_relations": [],
+            "comparison_matrix": None,
+            "comparison_analysis": None,
+        }
+
+    verified_claims = state.get("verified_claims", []) or state.get("claims", [])
+    included_chunks = state.get("filtered_chunks", [])
+    document_groups = state.get("document_evidence_groups") or {}
+    missing_docs = state.get("missing_documents") or []
+
+    detector = CrossDocumentRelationDetector(target_document_ids=document_ids)
+    summary = detector.detect_relations(
+        claims=verified_claims,
+        included_chunks=included_chunks,
+        document_groups=document_groups,
+        missing_documents=missing_docs,
+    )
+
+    return {
+        "comparison_relations": [r.to_dict() for r in summary.relations],
+        "comparison_analysis": summary.model_dump(),
+    }
+
+
 async def format_citations_node(
     state: LegalGraphState,
 ) -> dict[str, Any]:
@@ -533,6 +731,7 @@ async def format_citations_node(
     Validates, deduplicates, and formats citations into the final response payload.
 
     Aligns citations strictly with the evidence chunks actually included in the generation context.
+    Includes comparison analysis if comparison mode was active.
     """
     raw_answer = state.get("raw_answer", "")
     final_answer = state.get("final_answer", raw_answer)
@@ -547,6 +746,7 @@ async def format_citations_node(
     seen_provisions: set[str] = set()
 
     for chunk in candidate_chunks:
+        doc_id = chunk.get("document_id")
         act_or_doc = (
             chunk.get("act_name")
             or chunk.get("document_name")
@@ -554,7 +754,11 @@ async def format_citations_node(
             or "Unknown Statute"
         ).strip()
         section = (chunk.get("section") or chunk.get("heading") or "General Provision").strip()
-        unique_key = f"{act_or_doc.lower()}::{section.lower()}"
+        
+        if doc_id and str(doc_id).strip():
+            unique_key = f"{str(doc_id).strip().lower()}::{act_or_doc.lower()}::{section.lower()}"
+        else:
+            unique_key = f"{act_or_doc.lower()}::{section.lower()}"
 
         if unique_key in seen_provisions:
             continue
@@ -598,5 +802,6 @@ async def format_citations_node(
     return {
         "citations": formatted_citations,
         "final_answer": final_answer,
+        "comparison_analysis": state.get("comparison_analysis"),
     }
 

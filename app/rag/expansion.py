@@ -32,10 +32,12 @@ class ControlledEvidenceExpander:
         self,
         primary_chunks: list[dict[str, Any]],
         explicit_document_id: Optional[str] = None,
+        explicit_document_ids: Optional[list[str]] = None,
     ) -> EvidenceGraph:
         """
         Builds a query-local EvidenceGraph starting from primary retrieval hits.
         Expands up to max_primary_chunks_to_expand primary chunks by direct neighbors (depth=1).
+        Supports multi-document fair expansion and document isolation.
         """
         graph = EvidenceGraph()
 
@@ -60,8 +62,8 @@ class ControlledEvidenceExpander:
                 similarity_score=score_val,
                 evidence_role=EvidenceRole.PRIMARY,
                 chunk_index=chunk.get("chunk_index"),
-                prev_chunk_id=chunk.get("prev_chunk_id"),
-                next_chunk_id=chunk.get("next_chunk_id"),
+                prev_chunk_id=chunk.get("prev_chunk_id") or (chunk.get("structural_metadata") or {}).get("prev_chunk_id"),
+                next_chunk_id=chunk.get("next_chunk_id") or (chunk.get("structural_metadata") or {}).get("next_chunk_id"),
             )
             graph.add_node(node)
 
@@ -79,8 +81,28 @@ class ControlledEvidenceExpander:
             logger.debug("Neighbor expansion is disabled in configuration")
             return graph
 
-        # 3. Identify candidate primary chunks for expansion (up to max_primary_chunks_to_expand)
-        candidates_to_expand = primary_node_list[: self.settings.max_primary_chunks_to_expand]
+        # 3. Identify candidate primary chunks for expansion (fair round-robin across documents if multi-doc)
+        allowed_doc_filter = set(explicit_document_ids or [])
+        if explicit_document_id and explicit_document_id.strip():
+            allowed_doc_filter.add(explicit_document_id.strip())
+
+        if len(allowed_doc_filter) > 1:
+            candidates_to_expand: list[EvidenceNode] = []
+            nodes_by_doc: dict[str, list[EvidenceNode]] = {}
+            for n in primary_node_list:
+                doc_key = n.document_id or "default"
+                nodes_by_doc.setdefault(doc_key, []).append(n)
+
+            while len(candidates_to_expand) < self.settings.max_primary_chunks_to_expand:
+                added_any = False
+                for d_k in list(nodes_by_doc.keys()):
+                    if nodes_by_doc[d_k] and len(candidates_to_expand) < self.settings.max_primary_chunks_to_expand:
+                        candidates_to_expand.append(nodes_by_doc[d_k].pop(0))
+                        added_any = True
+                if not added_any:
+                    break
+        else:
+            candidates_to_expand = primary_node_list[: self.settings.max_primary_chunks_to_expand]
 
         lookup_targets: dict[str, dict[str, Any]] = {}
         total_expansion_slots_remaining = self.settings.max_total_expanded_chunks
@@ -158,12 +180,12 @@ class ControlledEvidenceExpander:
                 )
                 continue
 
-            # Security Rule: If query explicitly specified document_id, verify compliance
-            if explicit_document_id and actual_doc != explicit_document_id:
+            # Security Rule: If query explicitly specified document_id(s), verify compliance
+            if allowed_doc_filter and actual_doc not in allowed_doc_filter:
                 logger.warning(
-                    "Security/Isolation violation: Rejected neighbor chunk '%s'. Does not match explicit query document_id '%s'",
+                    "Security/Isolation violation: Rejected neighbor chunk '%s'. Does not match explicit query document_ids %s",
                     neighbor.chunk_id,
-                    explicit_document_id,
+                    allowed_doc_filter,
                 )
                 continue
 

@@ -122,18 +122,20 @@ class QdrantClientWrapper:
         min_score: float = DEFAULT_MIN_SIMILARITY_SCORE,
         domain_filter: Optional[str] = None,
         document_id_filter: Optional[str] = None,
+        document_ids_filter: Optional[list[str]] = None,
     ) -> list[RetrievedStatutoryChunk]:
         """
         Executes dense vector similarity search against the pre-embedded legal corpus.
-        Supports compound filtering on domain and document_id.
+        Supports compound filtering on domain, single document_id, or multiple document_ids.
         """
         logger.debug(
-            "Executing Qdrant vector search | collection: %s | top_k: %d | min_score: %.2f | domain: %s | doc_id: %s",
+            "Executing Qdrant vector search | collection: %s | top_k: %d | min_score: %.2f | domain: %s | doc_id: %s | doc_ids: %s",
             self.settings.qdrant_collection_name,
             top_k,
             min_score,
             domain_filter,
             document_id_filter,
+            document_ids_filter,
         )
 
         filter_conditions: list[models.FieldCondition] = []
@@ -144,11 +146,23 @@ class QdrantClientWrapper:
                     match=models.MatchValue(value=domain_filter.strip()),
                 )
             )
-        if document_id_filter and document_id_filter.strip():
+
+        doc_filter_list = [d.strip() for d in (document_ids_filter or []) if d and d.strip()]
+        if document_id_filter and document_id_filter.strip() and document_id_filter.strip() not in doc_filter_list:
+            doc_filter_list.append(document_id_filter.strip())
+
+        if len(doc_filter_list) == 1:
             filter_conditions.append(
                 models.FieldCondition(
                     key="document_id",
-                    match=models.MatchValue(value=document_id_filter.strip()),
+                    match=models.MatchValue(value=doc_filter_list[0]),
+                )
+            )
+        elif len(doc_filter_list) > 1:
+            filter_conditions.append(
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchAny(any=doc_filter_list),
                 )
             )
 
@@ -206,6 +220,43 @@ class QdrantClientWrapper:
             min_score,
         )
         return parsed_chunks
+
+    async def search_documents_balanced(
+        self,
+        query_vector: list[float],
+        document_ids: list[str],
+        top_k_per_doc: int = DEFAULT_TOP_K_RETRIEVAL,
+        min_score: float = DEFAULT_MIN_SIMILARITY_SCORE,
+        domain_filter: Optional[str] = None,
+    ) -> dict[str, list[RetrievedStatutoryChunk]]:
+        """
+        Executes dedicated per-document retrieval passes to prevent document starvation.
+        
+        Guarantees that each requested document has an independent candidate pool evaluated
+        against min_score, avoiding the document starvation problem inherent in single-pass search.
+        """
+        results_by_doc: dict[str, list[RetrievedStatutoryChunk]] = {}
+        for doc_id in document_ids:
+            clean_id = doc_id.strip() if doc_id else ""
+            if not clean_id:
+                continue
+            try:
+                chunks = await self.search_statutes(
+                    query_vector=query_vector,
+                    top_k=top_k_per_doc,
+                    min_score=min_score,
+                    domain_filter=domain_filter,
+                    document_id_filter=clean_id,
+                )
+                results_by_doc[clean_id] = chunks
+            except Exception as exc:
+                logger.warning(
+                    "Targeted retrieval failed for document_id '%s': %s. Continuing with available documents.",
+                    clean_id,
+                    exc,
+                )
+                results_by_doc[clean_id] = []
+        return results_by_doc
 
     async def ensure_collection_exists(
         self,

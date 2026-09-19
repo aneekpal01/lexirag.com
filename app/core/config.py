@@ -28,7 +28,10 @@ from app.core.constants import (
     DEFAULT_TOP_K_COMPLEX,
     DEFAULT_TOP_K_RETRIEVAL,
     DEFAULT_TOP_K_SIMPLE,
+    DEFAULT_TOP_K_PER_DOCUMENT,
     DEFAULT_VERIFICATION_MIN_OVERLAP_RATIO,
+    MAX_COMPARISON_DOCUMENTS,
+    DEFAULT_ENABLE_CROSS_DOC_RELATIONS,
     MAX_DOCUMENT_UPLOAD_SIZE_BYTES,
 )
 
@@ -178,6 +181,24 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Minimum lexical/entity token overlap ratio heuristic for substantive support evaluation.",
+    )
+
+    # Phase 5 Multi-Document Research & Comparison Configuration
+    top_k_per_document: int = Field(
+        default=DEFAULT_TOP_K_PER_DOCUMENT,
+        ge=1,
+        le=10,
+        description="Targeted retrieval chunk quota per document during multi-document research.",
+    )
+    max_comparison_documents: int = Field(
+        default=MAX_COMPARISON_DOCUMENTS,
+        ge=2,
+        le=10,
+        description="Maximum number of documents allowed in a single comparison query.",
+    )
+    enable_cross_document_relations: bool = Field(
+        default=DEFAULT_ENABLE_CROSS_DOC_RELATIONS,
+        description="Whether to run cross-document provision alignment and relation detection.",
     )
 
     # Clerk Authentication
